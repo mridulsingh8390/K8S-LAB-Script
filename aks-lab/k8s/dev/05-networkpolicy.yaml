@@ -1,0 +1,73 @@
+# ---------------------------------------------------------------------------
+# Goal: ping (ICMP) and other traffic to pods in `dev` should only succeed
+# from other pods that are ALSO in `dev`. Traffic from any other namespace
+# (or from outside the cluster) should be blocked.
+#
+# IMPORTANT CAVEAT: Kubernetes NetworkPolicy operates at L3/L4 (IP + TCP/UDP
+# port). The spec has no native concept of an ICMP protocol selector — most
+# CNIs (including Azure CNI's network policy, which is Calico-based) treat
+# the *absence* of a `ports` list in a NetworkPolicyPeer rule as "allow all
+# protocols/ports from that peer", which includes ICMP. That's exactly what
+# we want here: by restricting the allowed `from` peers to the dev namespace
+# without specifying ports, ping is allowed from dev and implicitly blocked
+# from everywhere else once this policy is applied (since this becomes the
+# only ingress rule and Kubernetes NetworkPolicies are deny-by-default for
+# any ingress rule that exists).
+#
+# Azure CNI clusters created with `--network-policy azure` (as in the infra
+# script) support this. If you used Calico instead (--network-policy calico)
+# the same manifest works identically, since both implement the standard
+# NetworkPolicy API.
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-intra-dev-only
+  namespace: dev
+spec:
+  podSelector: {}        # applies to ALL pods in the dev namespace
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector: {}   # any pod, but only matched...
+          namespaceSelector:
+            matchLabels:
+              environment: dev   # ...if it's in a namespace labeled environment=dev
+      # No `ports:` block specified intentionally -> allows all ports AND
+      # all protocols (TCP/UDP/ICMP) from matched peers, which is required
+      # for ping to work between dev pods.
+---
+# Optional companion policy: also restrict egress so dev pods can only
+# initiate traffic to other dev pods, DNS, and the SQL private endpoint.
+# Uncomment/adjust if you want east-west lockdown in both directions.
+# apiVersion: networking.k8s.io/v1
+# kind: NetworkPolicy
+# metadata:
+#   name: allow-intra-dev-egress
+#   namespace: dev
+# spec:
+#   podSelector: {}
+#   policyTypes:
+#     - Egress
+#   egress:
+#     - to:
+#         - namespaceSelector:
+#             matchLabels:
+#               environment: dev
+#     - to:                      # allow DNS resolution (kube-system coredns)
+#         - namespaceSelector: {}
+#           podSelector:
+#             matchLabels:
+#               k8s-app: kube-dns
+#       ports:
+#         - protocol: UDP
+#           port: 53
+#         - protocol: TCP
+#           port: 53
+#     - to:                      # allow egress to the SQL private endpoint subnet CIDR
+#         - ipBlock:
+#             cidr: 10.10.3.0/24
+#       ports:
+#         - protocol: TCP
+#           port: 1433

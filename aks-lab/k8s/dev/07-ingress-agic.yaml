@@ -1,0 +1,34 @@
+# ---------------------------------------------------------------------------
+# AGIC (Application Gateway Ingress Controller) watches Ingress resources
+# with the `azure/application-gateway` ingressClassName (or the legacy
+# kubernetes.io/ingress.class: azure/application-gateway annotation on
+# older AKS/AGIC versions) and configures the App Gateway created in the
+# infra script accordingly.
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: dotnet-helloworld-ingress
+  namespace: dev
+  annotations:
+    appgw.ingress.kubernetes.io/health-probe-path: "/"
+    appgw.ingress.kubernetes.io/request-timeout: "30"
+    # Use this if your AKS/AGIC version doesn't support spec.ingressClassName:
+    # kubernetes.io/ingress.class: azure/application-gateway
+spec:
+  ingressClassName: azure-application-gateway
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: dotnet-helloworld-svc
+                port:
+                  number: 80
+  # For TLS termination at the App Gateway, add:
+  # tls:
+  #   - hosts:
+  #       - app.example.com
+  #     secretName: dotnet-tls-secret   # a TLS-type k8s Secret, or use AGIC + Key Vault cert sync
