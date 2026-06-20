@@ -13,6 +13,55 @@ requirements with AWS-native primitives:
 | `--network-policy azure` (built-in) | Calico in policy-only mode on top of VPC CNI (separate install) |
 | AGIC (Application Gateway Ingress Controller) | AWS Load Balancer Controller + ALB Ingress |
 
+## Architecture — what's actually deployed
+
+This is the resource topology once `run-all.sh` finishes, not the order
+the scripts execute in. Solid arrows are network traffic; the dashed arrow
+is the secret-read path via IRSA, which is a control-plane call, not
+application traffic.
+
+```mermaid
+flowchart TB
+    Internet["Internet"]
+
+    subgraph VPC["VPC (eksctl-managed, 10.20.0.0/16)"]
+        subgraph PUBLIC_SUBNETS["Public subnets (tagged kubernetes.io/role/elb)"]
+            ALB["ALB<br/>target-type: ip, AWS LB Controller-managed"]
+        end
+
+        subgraph PRIVATE_SUBNETS_EKS["Private subnets - EKS node group"]
+            subgraph DEV_NS["dev namespace<br/>NetworkPolicy (Calico): dev-only ping + ALB subnets:8080"]
+                POD1["Pod 1<br/>dotnet-helloworld"]
+                POD2["Pod 2<br/>dotnet-helloworld"]
+                SVC["Service (ClusterIP)"]
+                CSI["Secrets Store CSI<br/>driver mount (AWS provider)"]
+            end
+            IRSA["IRSA role<br/>federated to dev SA via OIDC"]
+        end
+
+        subgraph PRIVATE_SUBNETS_RDS["Private subnets - RDS subnet group"]
+            SG["Security group<br/>allows 1433 from EKS node SG only"]
+            RDS["RDS SQL Server<br/>appdb, no public access"]
+        end
+
+        SM["Secrets Manager<br/>single JSON: username, password, host, port, dbname"]
+        ECR["ECR<br/>supplies the pod image"]
+    end
+
+    Internet -->|HTTP| ALB
+    ALB -->|"TCP 8080 only<br/>(NetworkPolicy allow)"| POD1
+    ALB -->|"TCP 8080 only<br/>(NetworkPolicy allow)"| POD2
+    POD1 --> SVC
+    POD2 --> SVC
+    POD1 --> CSI
+    POD2 --> CSI
+    CSI -.->|GetSecretValue via IRSA| SM
+    IRSA -.-> CSI
+    CSI --> SG
+    SG --> RDS
+    ECR -.->|pulls image at deploy time| POD1
+```
+
 ## Quickest path: one script
 
 ```bash
