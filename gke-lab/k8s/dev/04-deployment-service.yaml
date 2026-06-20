@@ -1,0 +1,127 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dotnet-helloworld
+  namespace: dev
+  labels:
+    app: dotnet-helloworld
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: dotnet-helloworld
+  template:
+    metadata:
+      labels:
+        app: dotnet-helloworld
+    spec:
+      serviceAccountName: dotnet-app-sa
+      containers:
+        - name: dotnet-helloworld
+          # Replace with your Artifact Registry URI, e.g.:
+          # us-central1-docker.pkg.dev/my-project/dotnet-helloworld/dotnet-helloworld:v1
+          image: <AR_URI>:v1
+          ports:
+            - containerPort: 8080
+          env:
+            - name: ASPNETCORE_HTTP_PORTS
+              value: "8080"
+            - name: SQL_ENCRYPT
+              valueFrom:
+                configMapKeyRef:
+                  name: dotnet-app-config
+                  key: SQL_ENCRYPT
+            - name: SQL_TRUST_SERVER_CERTIFICATE
+              valueFrom:
+                configMapKeyRef:
+                  name: dotnet-app-config
+                  key: SQL_TRUST_SERVER_CERTIFICATE
+            - name: SQL_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: sql-credentials
+                  key: SQL_USERNAME
+            - name: SQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: sql-credentials
+                  key: SQL_PASSWORD
+            - name: SQL_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: sql-credentials
+                  key: SQL_HOST
+            - name: SQL_PORT
+              valueFrom:
+                secretKeyRef:
+                  name: sql-credentials
+                  key: SQL_PORT
+            - name: SQL_DATABASE
+              valueFrom:
+                secretKeyRef:
+                  name: sql-credentials
+                  key: SQL_DATABASE
+            # ASP.NET Core convention: ConnectionStrings__Default maps to
+            # config key ConnectionStrings:Default in appsettings.
+            - name: ConnectionStrings__Default
+              value: "Server=tcp:$(SQL_HOST),$(SQL_PORT);Initial Catalog=$(SQL_DATABASE);User ID=$(SQL_USERNAME);Password=$(SQL_PASSWORD);Encrypt=True;TrustServerCertificate=False;Connection Timeout=30;"
+          volumeMounts:
+            - name: secrets-store
+              mountPath: "/mnt/secrets-store"
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+      volumes:
+        - name: secrets-store
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: dotnet-app-secrets-spc
+---
+# ---------------------------------------------------------------------------
+# ClusterIP, with an explicit NEG annotation - this is GCP's own recommended
+# pattern for container-native load balancing with GKE Ingress, NOT
+# NodePort. NodePort is only required as a fallback when NOT using NEGs
+# (the older, two-extra-network-hop path GCP's own docs advise against).
+#
+# IMPORTANT: GKE normally auto-adds the `cloud.google.com/neg: '{"ingress":
+# true}'` annotation for you automatically - but only when NOT using GKE
+# Network Policy. Since this lab enables Dataplane V2 (which provides
+# NetworkPolicy enforcement), that auto-annotation does NOT apply, so the
+# annotation below is added explicitly rather than relying on the default.
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: dotnet-helloworld-svc
+  namespace: dev
+  labels:
+    app: dotnet-helloworld
+  annotations:
+    cloud.google.com/neg: '{"ingress": true}'
+spec:
+  type: ClusterIP
+  selector:
+    app: dotnet-helloworld
+  ports:
+    - port: 80
+      targetPort: 8080
+      protocol: TCP

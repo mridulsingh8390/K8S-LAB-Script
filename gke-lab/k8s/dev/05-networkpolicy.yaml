@@ -1,0 +1,57 @@
+# ---------------------------------------------------------------------------
+# Goal: ping (ICMP) and other traffic to pods in `dev` should only succeed
+# from other pods that are ALSO in `dev`. Traffic from any other namespace
+# (or from outside the cluster) should be blocked - EXCEPT for GKE's load
+# balancer health-check probes, which need to reach the app's HTTP port for
+# the Ingress to ever report the backend as healthy.
+#
+# THIS SECOND RULE IS HERE FROM THE START because of two real, confirmed
+# incidents on the sibling labs in this series:
+#   - AKS: a dev-only NetworkPolicy silently blocked AGIC's health probes,
+#     since AGIC's traffic is genuinely external to the namespace from the
+#     policy's perspective.
+#   - EKS: the same shape of problem with the AWS Load Balancer Controller's
+#     ALB, plus a separate, more severe incident where actually enabling
+#     NetworkPolicy enforcement (Calico, then VPC CNI native mode) caused
+#     cluster-wide outages unrelated to this specific rule.
+#
+# GKE'S SITUATION IS GENUINELY BETTER HERE, for two reasons:
+#   1. GCP publishes FIXED, documented IP ranges for its load balancer
+#      health checkers (35.191.0.0/16 and 130.211.0.0/22) - this isn't a
+#      "whatever subnet the LB happens to land in" guess like the EKS lab
+#      needed; these ranges are stable, global, and the same for everyone.
+#   2. NetworkPolicy enforcement here is GKE Dataplane V2, built into the
+#      cluster's data path from creation (see 00-gcp-infra.sh) rather than
+#      retrofitted onto an already-running CNI after the fact - which is
+#      structurally the class of difference that caused the EKS incident.
+#      This does NOT guarantee Dataplane V2 is risk-free, but it avoids the
+#      specific "enabling this on a live cluster" risk pattern entirely.
+#
+# Kubernetes NetworkPolicy ingress rules are additive - traffic matching ANY
+# rule in the list is allowed.
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-intra-dev-only
+  namespace: dev
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector: {}
+          namespaceSelector:
+            matchLabels:
+              environment: dev
+      # No `ports:` block -> allows all ports/protocols (including ICMP)
+      # from matched peers, required for ping to work between dev pods.
+    - from:
+        - ipBlock:
+            cidr: 35.191.0.0/16
+        - ipBlock:
+            cidr: 130.211.0.0/22
+      ports:
+        - protocol: TCP
+          port: 8080   # the app's container port only; ICMP/other ports still blocked from these ranges
