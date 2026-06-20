@@ -1,0 +1,59 @@
+# ---------------------------------------------------------------------------
+# Goal: ping (ICMP) and other traffic to pods in `dev` should only succeed
+# from other pods that are ALSO in `dev`. Traffic from any other namespace
+# (or from outside the cluster) should be blocked — EXCEPT for the ALB
+# (AWS Load Balancer Controller's Ingress), which needs to reach the app's
+# HTTP port for its health checks and to proxy real traffic.
+#
+# THIS SECOND RULE IS HERE FROM THE START because of a real bug we found
+# and fixed on the AKS version of this lab: a NetworkPolicy scoped only to
+# the dev namespace silently blocked AGIC's health probes too, since
+# AGIC's traffic is genuinely external to the namespace from the policy's
+# perspective. The same risk applies here — ALB target group health checks
+# originate from the VPC CIDR (specifically, the subnets the ALB itself
+# sits in), not from inside the `dev` namespace, so without an explicit
+# allow this policy would silently break the ALB ingress exactly the way
+# it broke AGIC, with the same hard-to-diagnose symptom (target group
+# reports unhealthy, /everything else/ checks out fine).
+#
+# Unlike on AKS, ALB target group health checks for "instance" mode targets
+# typically arrive via the VPC CIDR rather than a single dedicated ALB
+# subnet CIDR (EKS+ALB Controller commonly runs in "ip" target type mode
+# for pod-direct routing, in which case the ALB's own ENIs — one per AZ
+# subnet it's deployed into — are the actual traffic source). Replace
+# <ALB-SUBNET-CIDRS> below with the CIDR(s) of the public subnets your ALB
+# is deployed into (same subnets eksctl tagged for "kubernetes.io/role/elb").
+# If unsure, the safest broad-but-still-restrictive option is the full VPC
+# CIDR rather than 0.0.0.0/0 — narrow further once you've confirmed exactly
+# which subnet the ALB's ENIs land in via the EC2 console.
+#
+# Kubernetes NetworkPolicy ingress rules are additive — traffic matching
+# ANY rule in the list is allowed. This requires Calico (or another
+# NetworkPolicy-enforcing CNI add-on) to be installed and running; the bare
+# AWS VPC CNI does not enforce NetworkPolicy objects on its own unless its
+# native NetworkPolicy mode is explicitly enabled (see 01-aws-lbc-and-
+# identity.sh for the alternative to Calico).
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-intra-dev-only
+  namespace: dev
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector: {}
+          namespaceSelector:
+            matchLabels:
+              environment: dev
+      # No `ports:` block -> allows all ports/protocols (including ICMP)
+      # from matched peers, required for ping to work between dev pods.
+    - from:
+        - ipBlock:
+            cidr: <ALB-SUBNET-CIDRS>   # e.g. 10.20.0.0/16 (whole VPC) as a starting point, narrow later
+      ports:
+        - protocol: TCP
+          port: 8080   # the app's container port only; ICMP/other ports still blocked from this peer
