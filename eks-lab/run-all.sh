@@ -4,7 +4,12 @@
 # End-to-end orchestrator for the EKS lab — same role as the AKS lab's
 # run-all.sh. Run this ONE script from the eks-lab/ directory and it will:
 #   1. Run 00-aws-infra.sh (VPC/EKS/ECR/RDS/Secrets Manager)
-#   2. Run 01-aws-lbc-and-identity.sh (IRSA, CSI driver, ALB controller, Calico)
+#   2. Run 01-aws-lbc-and-identity.sh (IRSA, CSI driver, ALB controller)
+#      NOTE: NetworkPolicy enforcement is NOT enabled by this step anymore.
+#      Both options tested (Calico, and VPC CNI's native enableNetworkPolicy
+#      mode) caused reproducible cluster-wide outages on this account/setup
+#      during real testing. See the warning block in
+#      01-aws-lbc-and-identity.sh before enabling either manually.
 #   3. Substitute every <PLACEHOLDER> in the k8s YAML and helper scripts
 #   4. Build and push the dotnet image to ECR
 #   5. kubectl apply everything in the correct order
@@ -62,7 +67,7 @@ echo ""
 read -r -p "Press Enter once the database has been created, to continue..." _
 
 echo "############################################################"
-echo "# STEP 2/5: IRSA, Secrets Store CSI driver, ALB controller, Calico"
+echo "# STEP 2/5: IRSA, Secrets Store CSI driver, ALB controller"
 echo "############################################################"
 chmod +x ./01-aws-lbc-and-identity.sh
 ./01-aws-lbc-and-identity.sh
@@ -94,12 +99,15 @@ do
 done
 
 echo ""
-echo "NOTE: k8s/dev/05-networkpolicy.yaml still has <ALB-SUBNET-CIDRS> as a"
-echo "placeholder — this is NOT auto-filled, since the right value depends"
-echo "on which subnets the ALB controller actually lands the load balancer"
-echo "in, which isn't known until after the Ingress is created in step 5."
-echo "The script applies a safe default (full VPC CIDR) below and prints"
-echo "instructions to narrow it afterward."
+echo "NOTE: k8s/dev/05-networkpolicy.yaml will be applied in step 5 as a"
+echo "Kubernetes object, but it currently has NO ENFORCEMENT ENGINE acting"
+echo "on it — 01-aws-lbc-and-identity.sh no longer enables Calico or VPC"
+echo "CNI's native NetworkPolicy mode by default, since both caused"
+echo "cluster-wide outages during real testing on this account/setup. The"
+echo "object will sit inert until you deliberately enable enforcement; see"
+echo "the warning in 01-aws-lbc-and-identity.sh first if you do."
+echo "Filling in its <ALB-SUBNET-CIDRS> placeholder now regardless, so the"
+echo "YAML is valid and ready whenever enforcement is enabled:"
 sed -i "s|<ALB-SUBNET-CIDRS>|${VPC_CIDR:-10.20.0.0/16}|g" k8s/dev/05-networkpolicy.yaml
 
 echo "############################################################"

@@ -166,7 +166,7 @@ aws rds create-db-subnet-group \
   --db-subnet-group-name "eks-lab-rds-subnet-group" \
   --db-subnet-group-description "Private subnets for eks-lab RDS SQL Server" \
   --subnet-ids $(echo "$PRIVATE_SUBNET_IDS" | tr ',' ' ') \
-  --region "$REGION" 2>/dev/null || echo "   (subnet group already exists, continuing)"
+  --region "$REGION" >/dev/null 2>&1 && echo "   subnet group created" || echo "   (subnet group already exists, continuing)"
 
 echo "==> Security group for RDS: allow inbound 1433 from EKS node security group only"
 EKS_NODE_SG=$(aws eks describe-cluster --name "$CLUSTER_NAME" --region "$REGION" \

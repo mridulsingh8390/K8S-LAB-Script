@@ -10,7 +10,7 @@ requirements with AWS-native primitives:
 | Azure Key Vault | AWS Secrets Manager |
 | Azure SQL + Private Endpoint | RDS SQL Server, private subnet, security-group-restricted |
 | Azure AD Workload Identity | IRSA (IAM Roles for Service Accounts) |
-| `--network-policy azure` (built-in) | Calico in policy-only mode on top of VPC CNI (separate install) |
+| `--network-policy azure` (built-in) | **Disabled by default, opt-in** — both options broke this cluster once, then worked cleanly on a retest with fresh nodes; see warning section below before enabling |
 | AGIC (Application Gateway Ingress Controller) | AWS Load Balancer Controller + ALB Ingress |
 
 ## Architecture — what's actually deployed
@@ -30,7 +30,7 @@ flowchart TB
         end
 
         subgraph PRIVATE_SUBNETS_EKS["Private subnets - EKS node group"]
-            subgraph DEV_NS["dev namespace<br/>NetworkPolicy (Calico): dev-only ping + ALB subnets:8080"]
+            subgraph DEV_NS["dev namespace<br/>NetworkPolicy object exists but is INERT - no enforcement engine enabled by default"]
                 POD1["Pod 1<br/>dotnet-helloworld"]
                 POD2["Pod 2<br/>dotnet-helloworld"]
                 SVC["Service (ClusterIP)"]
@@ -118,16 +118,18 @@ kubectl run sqlcmd-tmp --rm -it --restart=Never -n default \
   -Q "CREATE DATABASE appdb;"
 ```
 
-### 3. IRSA, Secrets Store CSI driver, ALB controller, Calico
+### 3. IRSA, Secrets Store CSI driver, ALB controller
 ```bash
 ./01-aws-lbc-and-identity.sh
 ```
 This is the step with no single-flag AKS equivalent — on AKS,
-`--enable-addons azure-keyvault-secrets-provider` and
-`--network-policy azure` did this in one command each. On EKS it's four
-separate installs: an IAM role (IRSA) for the pod, the Secrets Store CSI
-driver + AWS provider (Helm), the AWS Load Balancer Controller (Helm), and
-Calico (Tigera operator, policy-only mode on top of VPC CNI).
+`--enable-addons azure-keyvault-secrets-provider` did this in one command.
+On EKS it's three separate installs: an IAM role (IRSA) for the pod, the
+Secrets Store CSI driver + AWS provider (Helm), and the AWS Load Balancer
+Controller (Helm). NetworkPolicy enforcement (Calico or VPC CNI native
+mode) is intentionally **not** installed by this step anymore — see
+"NetworkPolicy enforcement is currently disabled by default" further down
+before considering either option.
 
 ### 4. Fill in placeholders
 | Placeholder | Where | Source |
@@ -141,8 +143,10 @@ Calico (Tigera operator, policy-only mode on top of VPC CNI).
 `run-all.sh` auto-fills everything except the NetworkPolicy's ALB CIDR,
 which it defaults to the full VPC CIDR as a safe starting point (broader
 than ideal, but functionally correct) and prints instructions to narrow
-afterward — see "Why the NetworkPolicy already accounts for the ALB"
-below for why this matters.
+afterward — see "What the NetworkPolicy YAML still accounts for" further
+down for why this matters. Note that the NetworkPolicy object itself is
+currently inert regardless, since no enforcement engine is enabled by
+default (see the dedicated warning section below).
 
 ### 5. Build, push, apply
 ```bash
@@ -168,8 +172,16 @@ kubectl exec -n dev deploy/dotnet-helloworld -- env | grep SQL_
 kubectl apply -f k8s/dev/06-network-test-pods.yaml
 DEV_IP=$(kubectl get pod -n dev net-test-dev -o jsonpath='{.status.podIP}')
 kubectl exec -n dev net-test-dev -- ping -c 3 "$DEV_IP"        # should succeed
-kubectl exec -n other-ns net-test-other -- ping -c 3 "$DEV_IP" # should fail/time out
+kubectl exec -n other-ns net-test-other -- ping -c 3 "$DEV_IP" # see note below
 ```
+NetworkPolicy enforcement is **not enabled by default** (see the
+dedicated section further down) — with it off, the second command will
+also succeed, since nothing is restricting cross-namespace traffic yet.
+That's expected and not a failure of anything; it just means enforcement
+hasn't been turned on. Once you deliberately enable it (same section
+below has the exact steps and the safety checks to run immediately
+after), this second command should show `100% packet loss` instead —
+confirmed working this way on a retest with freshly-replaced nodes.
 
 ### 8. Verify ALB ingress
 ```bash
@@ -182,34 +194,101 @@ curl -v http://<ADDRESS-from-above>/
 ./rotate-sql-password.sh
 ```
 
-## Why the NetworkPolicy already accounts for the ALB
+## NetworkPolicy enforcement — incident, then a successful retest
 
-The AKS version of this lab hit a real bug during testing: a NetworkPolicy
-scoped to allow traffic only from the `dev` namespace silently blocked
-AGIC's health probes too, since AGIC's traffic is genuinely external to
-the namespace from the policy's perspective — even though a completely
-separate Service of `type: LoadBalancer` to the same pods worked fine,
-which made the cause non-obvious at first. The fix was a second NetworkPolicy
-rule explicitly allowing the App Gateway's subnet CIDR through on the
-app's port only.
+This is the most important thing to understand before touching anything
+related to NetworkPolicy on this lab.
 
-The exact same risk applies here: the AWS Load Balancer Controller's ALB,
-running in `target-type: ip` mode, sends health-check and proxied traffic
-directly to pod IPs from the ALB's own subnets — traffic that's genuinely
-external to `dev` from Calico's policy-enforcement perspective, just like
-AGIC's was for Azure CNI. `05-networkpolicy.yaml` includes this allowance
-from the start, rather than making you rediscover the same bug.
+During initial end-to-end testing, **both** of the two standard options
+for enforcing NetworkPolicy on EKS caused severe, reproducible,
+cluster-wide outages on this account/cluster combination:
 
-The one thing that's *not* fully automated: which subnet CIDR to actually
-allow. On AKS, the App Gateway has a single dedicated subnet decided at
-infra-creation time, so the CIDR is known upfront. On EKS, the ALB
-controller picks subnets dynamically (any subnet tagged
+- **Calico** (Tigera operator, policy-only mode on top of VPC CNI) — the
+  AKS-parity choice this lab originally defaulted to.
+- **VPC CNI's own native NetworkPolicy mode** (`enableNetworkPolicy: "true"`
+  on the `vpc-cni` addon) — tried as the simpler, AWS-native alternative
+  after Calico failed.
+
+Both produced the same symptom: pod-to-pod connectivity loss and CoreDNS
+unable to reach the Kubernetes API server's ClusterIP
+(`dial tcp 172.20.0.1:443: i/o timeout`), affecting every pod on the
+affected node — not just NetworkPolicy-governed traffic. The breakage did
+**not** self-resolve when the feature was disabled again afterward; it
+only cleared once the affected EC2 instances were terminated and the node
+group replaced them with fresh ones.
+
+Every individual infrastructure layer was checked directly and came back
+clean: IAM permissions (including manually testing `ec2:CreateNetworkInterface`
+and `ec2:AttachNetworkInterface` with the AWS CLI), VPC route tables,
+security group rules (both the RDS SG and the EKS cluster SG), subnet IP
+capacity, AZ/subnet matching, IMDS reachability, and node resource
+pressure (`MemoryPressure`/`DiskPressure`/`PIDPressure` all `False`). None
+of them explained the failure.
+
+**A later retest succeeded.** After fully replacing both EC2 nodes
+(terminate + ASG replacement, so the cluster started from a known-clean
+state) and confirming both app replicas were stable with zero restarts,
+VPC CNI native mode was re-enabled and `k8s/dev/05-networkpolicy.yaml` was
+applied for real. This time: DNS continued resolving correctly throughout,
+no pods crashed, and the actual policy behavior was confirmed correct in
+both directions — ping succeeded from a pod inside `dev` to another pod
+in `dev`, and failed with 100% packet loss from a pod in a separate
+namespace (`other-ns`) to the same target.
+
+**What this does and does not prove.** It confirms the feature can work
+correctly on this cluster, and that a clean node state at the time of
+enabling appears to matter. It does **not** prove the original failure
+mode is fully understood or permanently fixed — the root cause was never
+conclusively identified, so we don't know with certainty whether "fresh
+nodes" was the actual fix, or whether some other factor coincided with
+the successful retest. Treat this as "worked cleanly on a retest with
+fresh nodes," not as a guarantee.
+
+**Practical guidance going forward:**
+- `01-aws-lbc-and-identity.sh` still does **not** enable NetworkPolicy
+  enforcement automatically — it remains an explicit, manual step.
+- If you enable it, do so on a cluster with recently-refreshed nodes
+  (ideally right after a fresh `run-all.sh` run, before much else has
+  happened to the cluster), and verify immediately afterward:
+  ```bash
+  kubectl run dnstest --rm -it --restart=Never --image=busybox -- \
+    nslookup kubernetes.default.svc.cluster.local
+  kubectl get pods -A | grep -v Running
+  ```
+- If either check shows a problem, revert immediately and consider
+  terminating the affected node rather than continuing to investigate
+  live — waiting and debugging in place is what turned the original
+  incident into a multi-hour outage.
+
+The exact commands to enable VPC CNI native mode (the option that worked
+on retest) are preserved as comments inside `01-aws-lbc-and-identity.sh`,
+along with Calico's install commands if you want to try that instead.
+Same caution either way: do this only with `cleanup.sh`/a fresh
+`run-all.sh` run as your rollback plan, and watch closely in the minutes
+right after enabling rather than waiting for a problem to become obvious
+on its own.
+
+## What the NetworkPolicy YAML still accounts for
+
+Separately from the above, the *content* of `05-networkpolicy.yaml` does
+correctly account for a real, different bug found on the AKS side of this
+lab: a NetworkPolicy scoped to allow traffic only from the `dev` namespace
+silently blocks AGIC's (or here, the ALB's) health probes too, since that
+traffic is genuinely external to the namespace from the policy's
+perspective — even though a separate `Service` of `type: LoadBalancer` to
+the same pods works fine, which makes the cause non-obvious at first.
+`05-networkpolicy.yaml` includes a second rule explicitly allowing the
+ALB's subnet CIDR through on the app's port only, so if/when enforcement
+is ever safely enabled here, this particular gotcha is already handled.
+
+The one thing that's *not* fully automated even in the YAML: which subnet
+CIDR to actually allow. On AKS, the App Gateway has a single dedicated
+subnet decided at infra-creation time, so the CIDR is known upfront. On
+EKS, the ALB controller picks subnets dynamically (any subnet tagged
 `kubernetes.io/role/elb`), and you don't know exactly which ones it used
 until after the Ingress is created and the ALB exists. `run-all.sh`
-defaults the NetworkPolicy to the full VPC CIDR as a safe, functional
-starting point — broader than strictly necessary, but correct — and the
-script prints instructions to narrow it down to the ALB's actual subnets
-once you can see them:
+defaults this to the full VPC CIDR as a safe, functional placeholder, and
+you can narrow it down to the ALB's actual subnets once you can see them:
 ```bash
 aws elbv2 describe-load-balancers --region <region> \
   --query "LoadBalancers[?contains(LoadBalancerName, 'k8s-dev-dotnethel')].AvailabilityZones[].SubnetId"
@@ -218,17 +297,6 @@ Then look up each subnet's CIDR and update the `ipBlock.cidr` in
 `05-networkpolicy.yaml` (NetworkPolicy `ipBlock` only accepts one CIDR per
 entry — list multiple entries under `from:` if the ALB spans more than
 one subnet, which it normally does for high availability across AZs).
-
-## Why Calico is more involved here than on AKS
-
-AKS gives you `--network-policy azure` as a single flag at cluster
-creation — Azure CNI bundles a built-in NetworkPolicy enforcement engine.
-EKS's default VPC CNI does not enforce NetworkPolicy objects at all unless
-you explicitly add either Calico (Tigera operator, the option used here)
-or enable VPC CNI's own newer native NetworkPolicy mode (a single
-`enableNetworkPolicy: "true"` config value on the `vpc-cni` addon — see
-the commented alternative in `01-aws-lbc-and-identity.sh` if you'd rather
-use that simpler path instead of Calico).
 
 ## Tearing everything down
 

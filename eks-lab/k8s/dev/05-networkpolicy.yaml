@@ -28,11 +28,22 @@
 # which subnet the ALB's ENIs land in via the EC2 console.
 #
 # Kubernetes NetworkPolicy ingress rules are additive — traffic matching
-# ANY rule in the list is allowed. This requires Calico (or another
-# NetworkPolicy-enforcing CNI add-on) to be installed and running; the bare
-# AWS VPC CNI does not enforce NetworkPolicy objects on its own unless its
-# native NetworkPolicy mode is explicitly enabled (see 01-aws-lbc-and-
-# identity.sh for the alternative to Calico).
+# ANY rule in the list is allowed. This requires a NetworkPolicy-enforcing
+# CNI configuration; the bare AWS VPC CNI does not enforce NetworkPolicy
+# objects on its own.
+#
+# ENFORCEMENT ENGINE: this lab uses VPC CNI's own native NetworkPolicy mode
+# (enabled via `aws eks update-addon --addon-name vpc-cni --configuration-
+# values '{"enableNetworkPolicy":"true"}'`, done in 01-aws-lbc-and-
+# identity.sh), NOT Calico. Calico was tried first and caused severe,
+# reproducible cluster-wide breakage during real testing — pod-to-pod
+# connectivity loss, CoreDNS unable to reach the API server, multiple
+# pods crash-looping across the cluster — that was only resolved by
+# terminating affected nodes and replacing Calico with VPC CNI's native
+# mode entirely. If you ever reintroduce Calico, re-test this policy from
+# scratch on a disposable cluster first; do not assume it behaves
+# identically to native mode just because both implement the same
+# NetworkPolicy API surface.
 # ---------------------------------------------------------------------------
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

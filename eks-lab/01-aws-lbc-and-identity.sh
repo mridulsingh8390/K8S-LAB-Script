@@ -7,12 +7,11 @@
 #   - Secrets Store CSI driver + the AWS provider for it (the AWS analog
 #     to AKS's azure-keyvault-secrets-provider addon)
 #   - AWS Load Balancer Controller (the AWS analog to AGIC)
-#   - Calico in policy-only mode on top of the VPC CNI (the AWS analog to
-#     AKS's --network-policy azure flag) — this one genuinely is more
-#     involved on EKS than AKS; there is no single "enable network policy"
-#     addon flag for Calico specifically (AWS's own VPC CNI has a native
-#     NetworkPolicy mode as an alternative — see the comment further down
-#     if you'd rather use that rate than full Calico).
+#   - NetworkPolicy enforcement via VPC CNI's native mode (the AWS analog
+#     to AKS's --network-policy azure flag). This was originally Calico
+#     (Tigera operator, policy-only mode) but that caused severe,
+#     reproducible cluster-wide breakage during real testing — see the
+#     detailed warning in Step 4/4 below before considering switching back.
 #
 # Run this AFTER 00-aws-infra.sh.
 # ---------------------------------------------------------------------------
@@ -94,7 +93,17 @@ helm upgrade --install csi-secrets-store \
   secrets-store-csi-driver/secrets-store-csi-driver \
   --namespace kube-system \
   --set syncSecret.enabled=true \
-  --set enableSecretRotation=true
+  --set enableSecretRotation=true \
+  --set 'tokenRequests[0].audience=sts.amazonaws.com'
+# tokenRequests is REQUIRED for the AWS provider to authenticate via IRSA —
+# without it, the CSIDriver object has no tokenRequests configured, and
+# every pod mount fails with:
+#   "CSI token error: serviceAccount.tokens not provided - ensure
+#    tokenRequests is configured in CSIDriver"
+# This is documented directly in the AWS provider's own README but is NOT
+# the chart's default — confirmed the hard way during testing (pods stuck
+# in ContainerCreating indefinitely until this flag was added and the
+# pods were deleted to force a remount attempt).
 
 # The AWS provider for the CSI driver (lets it actually talk to Secrets Manager)
 kubectl apply -f https://raw.githubusercontent.com/aws/secrets-store-csi-driver-provider-aws/main/deployment/aws-provider-installer.yaml
@@ -134,56 +143,60 @@ echo "    ...waiting for the controller deployment to roll out"
 kubectl rollout status deployment/aws-load-balancer-controller -n kube-system --timeout=120s
 
 echo "############################################################"
-echo "# 4/4: Calico (policy-only mode on top of VPC CNI) for NetworkPolicy enforcement"
+echo "# 4/4: NetworkPolicy enforcement — VPC CNI native mode, opt-in"
 echo "############################################################"
-# This is the more involved AWS equivalent of AKS's --network-policy azure
-# flag. AWS VPC CNI's OWN native NetworkPolicy mode (enableNetworkPolicy on
-# the vpc-cni addon) is a simpler, AWS-native alternative if you'd rather
-# not run Calico at all — see the commented block below. Since Calico was
-# the explicit choice for this lab, we install the Tigera operator and
-# configure Calico in policy-only mode (Calico does NOT replace VPC CNI's
-# networking/IPAM here, only adds policy enforcement on top of it).
-kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.28.0/manifests/operator-crds.yaml
-kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.28.0/manifests/tigera-operator.yaml
-
-kubectl wait --for=condition=Available deployment/tigera-operator -n tigera-operator --timeout=180s
-
-cat <<'EOF' | kubectl apply -f -
-apiVersion: operator.tigera.io/v1
-kind: Installation
-metadata:
-  name: default
-spec:
-  kubernetesProvider: EKS
-  cni:
-    type: AmazonVPC
-  calicoNetwork: null
-EOF
-
-echo "    ...waiting for Calico to report ready (can take a few minutes)"
-sleep 30
-kubectl get pods -n calico-system
-
-# Annotate aws-node so pod IPs propagate to Calico promptly (documented
-# requirement for VPC-CNI + Calico policy-only mode)
-kubectl set env -n kube-system daemonset/aws-node ANNOTATE_POD_IP=true
-
 # ---------------------------------------------------------------------------
-# ALTERNATIVE (not used here, since Calico was the explicit choice): AWS
-# VPC CNI's own native NetworkPolicy support needs no separate install —
-# just enable it on the vpc-cni addon itself:
-#   eksctl utils update-cluster-vpc-cni-addon --cluster $CLUSTER_NAME \
-#     --region $REGION --enable-network-policy
-# If you ever want to switch, uninstall Calico first
-# (kubectl delete -f the same manifests above) to avoid both controllers
-# fighting over the same NetworkPolicy objects.
+# UPDATED AFTER FURTHER TESTING — read this before deciding whether to
+# enable this step.
+#
+# Earlier testing found that BOTH Calico and VPC CNI's native
+# NetworkPolicy mode caused severe, reproducible cluster-wide outages
+# (pod-to-pod connectivity loss, CoreDNS unable to reach the API server)
+# on this account/cluster. That finding led this script to disable
+# NetworkPolicy enforcement entirely by default.
+#
+# A later retest, performed AFTER fully replacing both EC2 nodes (via
+# termination + ASG replacement) so the cluster was in a known-clean
+# state, enabled VPC CNI's native mode again and applied the actual
+# NetworkPolicy object. This time it worked correctly: DNS and pod health
+# remained stable through the whole process, and the dev-only ping
+# restriction was confirmed working in both directions (intra-namespace
+# allowed, cross-namespace blocked, 100% packet loss).
+#
+# What this does and does NOT prove: it confirms the feature CAN work
+# correctly on this cluster type, and that a clean node state at the time
+# of enabling appears to matter. It does NOT prove the earlier failure
+# mode is fixed or fully understood — the original root cause was never
+# conclusively identified, and we don't know for certain whether the fix
+# was "fresh nodes," "this particular sequence of changes," or something
+# else entirely that happened to align with the retest. Treat this as
+# "worked cleanly on a retest with fresh nodes," not "definitively safe."
+#
+# THEREFORE: this step remains commented out / opt-in rather than
+# automatic in run-all.sh. If you choose to enable it, do so on a cluster
+# you've recently refreshed (fresh nodes, like the retest), and verify
+# immediately afterward with the same checks used in both the original
+# incident and the successful retest:
+#   kubectl run dnstest --rm -it --restart=Never --image=busybox -- \
+#     nslookup kubernetes.default.svc.cluster.local
+#   kubectl get pods -A | grep -v Running
+# If either shows a problem, revert immediately (see OPTION 1 command
+# below) rather than continuing to investigate live — that was the
+# costly mistake during the original incident.
 # ---------------------------------------------------------------------------
+
+echo "NetworkPolicy enforcement NOT enabled automatically by this script."
+echo "See the comment block above for the retest findings and the exact"
+echo "commands to enable it yourself if you choose to, plus the immediate"
+echo "verification steps to run right after."
 
 echo "============================================================"
 echo "DONE."
 echo "  Pod IAM role ARN:            $POD_ROLE_ARN"
 echo "  AWS Load Balancer Controller: installed in kube-system"
-echo "  Calico:                       installed in calico-system (policy-only mode)"
+echo "  NetworkPolicy enforcement:    NOT enabled by default (worked cleanly"
+echo "                                 on a retest with fresh nodes - see the"
+echo "                                 comment block above before enabling)"
 echo "============================================================"
 echo "Update the placeholder in k8s/dev/01-serviceaccount.yaml with:"
 echo "  $POD_ROLE_ARN"
