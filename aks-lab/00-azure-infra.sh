@@ -10,7 +10,7 @@ set -euo pipefail
 
 # ---- Variables: EDIT THESE ----
 RG="rg-aks-lab"
-LOCATION="eastus"
+LOCATION="eastus2"
 VNET_NAME="vnet-aks-lab"
 VNET_CIDR="10.10.0.0/16"
 AKS_SUBNET_NAME="snet-aks"
