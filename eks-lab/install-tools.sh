@@ -33,7 +33,7 @@ aws --version
 echo "############################################################"
 echo "# 3/6: eksctl"
 echo "############################################################"
-ARCH=$(uname -m)
+ARCH=$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')
 PLATFORM="Linux_${ARCH}"
 curl -sL "https://github.com/eksctl-io/eksctl/releases/latest/download/eksctl_${PLATFORM}.tar.gz" | sudo tar xz -C /usr/local/bin
 eksctl version
