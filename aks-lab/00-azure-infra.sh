@@ -10,7 +10,7 @@ set -euo pipefail
 
 # ---- Variables: EDIT THESE ----
 RG="rg-aks-lab"
-LOCATION="eastus2"
+LOCATION="centralindia"   # confirmed working for this subscription; eastus/eastus2 hit RegionDoesNotAllowProvisioning for SQL
 VNET_NAME="vnet-aks-lab"
 VNET_CIDR="10.10.0.0/16"
 AKS_SUBNET_NAME="snet-aks"
@@ -31,12 +31,80 @@ SQL_ADMIN_PASS="$(openssl rand -base64 24)"   # generated; you'll rotate via Key
 APPGW_NAME="appgw-aks-lab"
 APPGW_PUBLIC_IP_NAME="pip-appgw-aks-lab"
 
+# ---------------------------------------------------------------------------
+# wait_for_resource: polls `az resource show` on a resource ID until its
+# provisioningState is "Succeeded", or until TIMEOUT_SECS elapses.
+#
+# Why this exists: az's create commands for some resource types (notably
+# SQL servers) return control as soon as the control-plane operation is
+# accepted, slightly before the resource is reliably queryable by every
+# subsequent API call (e.g. `az sql server show`, or a private-endpoint
+# create that needs to resolve --private-connection-resource-id). This
+# caused a real failure during testing: a private-endpoint create command
+# got "ResourceNotFound" on a SQL server that, seconds later, queried fine.
+# This function closes that race by actively confirming the resource is
+# visible and Succeeded before the script's next command depends on it.
+#
+# Usage: wait_for_resource "<full-resource-id>" "<friendly-name-for-logging>"
+# ---------------------------------------------------------------------------
+wait_for_resource() {
+  local resource_id="$1"
+  local label="${2:-resource}"
+  local timeout_secs=300
+  local interval_secs=5
+  local elapsed=0
+
+  echo "    ...waiting for $label to be queryable and Succeeded (timeout ${timeout_secs}s)"
+  while [ "$elapsed" -lt "$timeout_secs" ]; do
+    local state
+    state=$(az resource show --ids "$resource_id" --query "properties.provisioningState" -o tsv 2>/dev/null || echo "")
+    if [ "$state" == "Succeeded" ]; then
+      echo "    ...$label is ready (provisioningState=Succeeded) after ${elapsed}s"
+      return 0
+    fi
+    sleep "$interval_secs"
+    elapsed=$((elapsed + interval_secs))
+  done
+
+  echo "    ...WARNING: $label did not report Succeeded within ${timeout_secs}s (last state: '${state:-unknown}'). Continuing anyway — if the next step fails with ResourceNotFound, re-run this script; the resource is likely still propagating."
+  return 0
+}
+
 echo "==> Resource Group"
 az group create -n "$RG" -l "$LOCATION"
+
+# ---------------------------------------------------------------------------
+# Guard against resuming into a partially-completed previous run. This
+# script is NOT safe to re-run blindly once resources like the SQL private
+# endpoint exist, because the VNet/subnet create calls that follow will
+# conflict with an in-use subnet (seen during testing: "InUseSubnetCannotBeDeleted").
+# If a previous attempt got partway through, the safest move is a full
+# `az group delete -n $RG --yes` (wait for it to finish, no --no-wait) before
+# re-running this script. This check won't fix that for you — it just stops
+# you from hitting a confusing downstream error instead of a clear one.
+# ---------------------------------------------------------------------------
+EXISTING_RESOURCES=$(az resource list -g "$RG" --query "length([])" -o tsv)
+if [ "$EXISTING_RESOURCES" -gt 0 ]; then
+  echo ""
+  echo "WARNING: resource group '$RG' already contains $EXISTING_RESOURCES resource(s)"
+  echo "from a previous run. This script is not safe to resume on top of"
+  echo "partially-created infra (it can hit subnet/private-endpoint conflicts)."
+  echo ""
+  az resource list -g "$RG" -o table
+  echo ""
+  read -r -p "Continue anyway? Only do this if you're sure these resources are compatible with a fresh run (y/N): " CONTINUE_ANYWAY
+  if [ "$CONTINUE_ANYWAY" != "y" ] && [ "$CONTINUE_ANYWAY" != "Y" ]; then
+    echo "Aborting. Recommended: az group delete -n $RG --yes   (wait for it to fully finish), then re-run."
+    exit 1
+  fi
+fi
 
 echo "==> VNet + Subnets"
 az network vnet create -g "$RG" -n "$VNET_NAME" --address-prefix "$VNET_CIDR" \
   --subnet-name "$AKS_SUBNET_NAME" --subnet-prefix "$AKS_SUBNET_CIDR"
+
+VNET_ID=$(az network vnet show -g "$RG" -n "$VNET_NAME" --query id -o tsv)
+wait_for_resource "$VNET_ID" "VNet $VNET_NAME"
 
 az network vnet subnet create -g "$RG" --vnet-name "$VNET_NAME" \
   -n "$AGIC_SUBNET_NAME" --address-prefix "$AGIC_SUBNET_CIDR"
@@ -71,6 +139,9 @@ kubectl create namespace dev --dry-run=client -o yaml | kubectl apply -f -
 echo "==> Key Vault"
 az keyvault create -g "$RG" -n "$KV_NAME" -l "$LOCATION" --enable-rbac-authorization false
 
+KV_ID=$(az keyvault show -g "$RG" -n "$KV_NAME" --query id -o tsv)
+wait_for_resource "$KV_ID" "Key Vault $KV_NAME"
+
 echo "==> Store initial SQL admin password in Key Vault"
 az keyvault secret set --vault-name "$KV_NAME" --name "sql-admin-password" --value "$SQL_ADMIN_PASS"
 
@@ -79,18 +150,22 @@ az sql server create -g "$RG" -n "$SQL_SERVER_NAME" \
   --admin-user "$SQL_ADMIN_USER" --admin-password "$SQL_ADMIN_PASS" \
   --enable-public-network false
 
+SQL_SERVER_ID_EARLY=$(az sql server show -g "$RG" -n "$SQL_SERVER_NAME" --query id -o tsv)
+wait_for_resource "$SQL_SERVER_ID_EARLY" "SQL server $SQL_SERVER_NAME"
+
 az sql db create -g "$RG" -s "$SQL_SERVER_NAME" -n "$SQL_DB_NAME" \
   --service-objective S0
 
 echo "==> Private Endpoint for SQL server in snet-sql-pe"
 SQL_SERVER_ID=$(az sql server show -g "$RG" -n "$SQL_SERVER_NAME" --query id -o tsv)
-SQL_SUBNET_ID=$(az network vnet subnet show -g "$RG" --vnet-name "$VNET_NAME" \
-  -n "$SQL_SUBNET_NAME" --query id -o tsv)
 
 az network private-endpoint create -g "$RG" -n "pe-$SQL_SERVER_NAME" \
   --vnet-name "$VNET_NAME" --subnet "$SQL_SUBNET_NAME" \
   --private-connection-resource-id "$SQL_SERVER_ID" \
   --group-id sqlServer --connection-name "sqlpe-conn"
+
+PE_ID=$(az network private-endpoint show -g "$RG" -n "pe-$SQL_SERVER_NAME" --query id -o tsv)
+wait_for_resource "$PE_ID" "private endpoint pe-$SQL_SERVER_NAME"
 
 echo "==> Private DNS zone for privatelink.database.windows.net"
 az network private-dns zone create -g "$RG" -n "privatelink.database.windows.net"
@@ -114,6 +189,11 @@ echo "==> Grant AKS Key Vault Secrets Provider managed identity access to Key Va
 KUBELET_IDENTITY_OBJECT_ID=$(az aks show -g "$RG" -n "$AKS_NAME" \
   --query addonProfiles.azureKeyvaultSecretsProvider.identity.objectId -o tsv)
 
+# This identity's object ID can occasionally lag slightly behind AAD's own
+# replication right after AKS finishes provisioning the addon, even though
+# the cluster itself reports Succeeded. If keyvault set-policy below fails
+# with an "ObjectId not found in AAD" type error, that's this same race —
+# re-run the script.
 az keyvault set-policy -n "$KV_NAME" \
   --object-id "$KUBELET_IDENTITY_OBJECT_ID" \
   --secret-permissions get list
@@ -129,6 +209,7 @@ az network application-gateway create -g "$RG" -n "$APPGW_NAME" \
   --subnet "$AGIC_SUBNET_ID" --priority 100
 
 APPGW_ID=$(az network application-gateway show -g "$RG" -n "$APPGW_NAME" --query id -o tsv)
+wait_for_resource "$APPGW_ID" "Application Gateway $APPGW_NAME"
 
 az aks enable-addons -g "$RG" -n "$AKS_NAME" \
   --addons ingress-appgw --appgw-id "$APPGW_ID"
