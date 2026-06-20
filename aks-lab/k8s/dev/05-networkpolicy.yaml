@@ -1,18 +1,30 @@
 # ---------------------------------------------------------------------------
 # Goal: ping (ICMP) and other traffic to pods in `dev` should only succeed
 # from other pods that are ALSO in `dev`. Traffic from any other namespace
-# (or from outside the cluster) should be blocked.
+# (or from outside the cluster) should be blocked — EXCEPT for the
+# Application Gateway, which needs to reach the app's HTTP port to do its
+# health probes and proxy real traffic; without an explicit allow, AGIC's
+# probes get blocked by this same policy (confirmed during testing: removing
+# this policy flipped App Gateway's backend health from Unhealthy straight
+# to Healthy, with no other change).
 #
 # IMPORTANT CAVEAT: Kubernetes NetworkPolicy operates at L3/L4 (IP + TCP/UDP
 # port). The spec has no native concept of an ICMP protocol selector — most
 # CNIs (including Azure CNI's network policy, which is Calico-based) treat
 # the *absence* of a `ports` list in a NetworkPolicyPeer rule as "allow all
 # protocols/ports from that peer", which includes ICMP. That's exactly what
-# we want here: by restricting the allowed `from` peers to the dev namespace
-# without specifying ports, ping is allowed from dev and implicitly blocked
-# from everywhere else once this policy is applied (since this becomes the
-# only ingress rule and Kubernetes NetworkPolicies are deny-by-default for
-# any ingress rule that exists).
+# we want for the dev-namespace rule: by restricting it to peers in the dev
+# namespace without specifying ports, ping is allowed from dev and
+# implicitly blocked from everywhere else NOT otherwise allowed by another
+# rule in this policy (Kubernetes NetworkPolicy ingress rules are additive —
+# traffic is allowed if it matches ANY rule in the list).
+#
+# The App Gateway rule below is deliberately scoped to TCP/8080 only (the
+# app's actual port) via an ipBlock matching the App Gateway subnet CIDR —
+# NOT a blanket all-ports/all-protocols allow like the dev-namespace rule.
+# This means ICMP from the App Gateway subnet is still blocked; only HTTP
+# traffic on the app's port is permitted. If your AppGW subnet CIDR differs
+# from 10.10.2.0/24, update the cidr value below to match.
 #
 # Azure CNI clusters created with `--network-policy azure` (as in the infra
 # script) support this. If you used Calico instead (--network-policy calico)
@@ -37,6 +49,12 @@ spec:
       # No `ports:` block specified intentionally -> allows all ports AND
       # all protocols (TCP/UDP/ICMP) from matched peers, which is required
       # for ping to work between dev pods.
+    - from:
+        - ipBlock:
+            cidr: 10.10.2.0/24   # snet-appgw — Application Gateway's subnet
+      ports:
+        - protocol: TCP
+          port: 8080   # the app's container port only; no ICMP/other ports allowed from this peer
 ---
 # Optional companion policy: also restrict egress so dev pods can only
 # initiate traffic to other dev pods, DNS, and the SQL private endpoint.
