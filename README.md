@@ -22,8 +22,9 @@ across all three clouds. Read top to bottom within a column; read across
 a row to compare the same step on each cloud.
 
 ```mermaid
-flowchart TB
+flowchart LR
     subgraph AKS["AKS (Azure)"]
+        direction TB
         A1["1. VNet + subnets"]
         A2["2. AKS cluster<br/>Azure CNI"]
         A3["3. Azure SQL<br/>+ private endpoint resource"]
@@ -36,6 +37,7 @@ flowchart TB
     end
 
     subgraph EKS["EKS (AWS)"]
+        direction TB
         E1["1. VPC + subnets<br/>via eksctl"]
         E2["2. EKS cluster<br/>VPC CNI, OIDC enabled"]
         E3["3. RDS SQL Server<br/>private subnet + security group"]
@@ -48,8 +50,9 @@ flowchart TB
     end
 
     subgraph GKE["GKE (GCP)"]
+        direction TB
         G1["1. VPC + subnet<br/>+ PSA range"]
-        G2["2. GKE cluster<br/>Dataplane V2 + Workload Identity at creation"]
+        G2["2. GKE cluster<br/>Dataplane V2 + WIF at creation"]
         G3["3. Cloud SQL<br/>private IP via PSA peering"]
         G4["4. Secret Manager<br/>5 separate secrets"]
         G5["5. Workload Identity Federation<br/>GSA to KSA"]
