@@ -1,0 +1,104 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dotnet-helloworld
+  namespace: dev
+  labels:
+    app: dotnet-helloworld
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: dotnet-helloworld
+  template:
+    metadata:
+      labels:
+        app: dotnet-helloworld
+        azure.workload.identity/use: "true"
+    spec:
+      serviceAccountName: dotnet-app-sa
+      containers:
+        - name: dotnet-helloworld
+          # Replace with your ACR login server, e.g.:
+          # acrakslab1234.azurecr.io/dotnet-helloworld:v1
+          image: <ACR_NAME>.azurecr.io/dotnet-helloworld:v1
+          ports:
+            - containerPort: 8080
+          env:
+            - name: ASPNETCORE_HTTP_PORTS
+              value: "8080"
+            - name: SQL_SERVER_FQDN
+              valueFrom:
+                configMapKeyRef:
+                  name: dotnet-app-config
+                  key: SQL_SERVER_FQDN
+            - name: SQL_SERVER_IP
+              valueFrom:
+                configMapKeyRef:
+                  name: dotnet-app-config
+                  key: SQL_SERVER_IP
+            - name: SQL_DATABASE
+              valueFrom:
+                configMapKeyRef:
+                  name: dotnet-app-config
+                  key: SQL_DATABASE
+            - name: SQL_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: sql-credentials
+                  key: SQL_USERNAME
+            - name: SQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: sql-credentials
+                  key: SQL_PASSWORD
+            # ASP.NET Core convention: ConnectionStrings__Default maps to
+            # config key ConnectionStrings:Default in appsettings.
+            - name: ConnectionStrings__Default
+              value: "Server=tcp:$(SQL_SERVER_FQDN),1433;Initial Catalog=$(SQL_DATABASE);User ID=$(SQL_USERNAME);Password=$(SQL_PASSWORD);Encrypt=True;TrustServerCertificate=False;Connection Timeout=30;"
+          volumeMounts:
+            - name: secrets-store
+              mountPath: "/mnt/secrets-store"
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+      volumes:
+        - name: secrets-store
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: dotnet-app-kv-spc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dotnet-helloworld-svc
+  namespace: dev
+  labels:
+    app: dotnet-helloworld
+spec:
+  type: ClusterIP
+  selector:
+    app: dotnet-helloworld
+  ports:
+    - port: 80
+      targetPort: 8080
+      protocol: TCP

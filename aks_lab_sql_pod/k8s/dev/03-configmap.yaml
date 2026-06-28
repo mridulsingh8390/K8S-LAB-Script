@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dotnet-app-config
+  namespace: dev
+data:
+  # Prefer the private-link FQDN over a raw IP: it always resolves correctly
+  # from inside the VNet via the private DNS zone, and survives the
+  # private endpoint's IP changing on recreation. Falling back to the literal
+  # private IP is shown as SQL_SERVER_IP below if you specifically need it.
+  SQL_SERVER_FQDN: "<SQL_SERVER_NAME>.database.windows.net"
+  SQL_SERVER_IP: "<SQL-PRIVATE-ENDPOINT-IP>"     # e.g. 10.10.3.4 - from script output
+  SQL_DATABASE: "appdb"
+  SQL_ENCRYPT: "true"
+  SQL_TRUST_SERVER_CERTIFICATE: "false"
