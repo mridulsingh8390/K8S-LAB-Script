@@ -1,0 +1,112 @@
+# ---------------------------------------------------------------------------
+# IMPORTANT, READ BEFORE APPLYING THIS FILE:
+#
+# This patches the SAME Deployment from k8s/dev/04-deployment-service.yaml
+# to point at the in-cluster PostgreSQL StatefulSet instead of RDS SQL
+# Server. The connection string format below (Npgsql-style:
+# Host=...;Username=...) is correct FOR POSTGRESQL - but the original
+# HelloWorldApp.web sample app was built and tested against SQL Server in
+# this lab series. Its actual source code was never confirmed to use a
+# Postgres-compatible driver (Npgsql) rather than Microsoft.Data.SqlClient.
+# Simply changing the connection string format does NOT make a
+# SQL-Server-oriented .NET app start talking to Postgres - that requires
+# the app's own code to use a Postgres driver, which is a change to the
+# application source, not something fixable from Kubernetes manifests
+# alone. Same limitation as the AKS lab's equivalent variant.
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dotnet-app-config-postgres
+  namespace: dev
+data:
+  POSTGRES_HOST: "postgres-svc.dev.svc.cluster.local"
+  POSTGRES_PORT: "5432"
+  POSTGRES_DATABASE: "appdb"
+  POSTGRES_SSLMODE: "disable"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dotnet-helloworld
+  namespace: dev
+  labels:
+    app: dotnet-helloworld
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: dotnet-helloworld
+  template:
+    metadata:
+      labels:
+        app: dotnet-helloworld
+    spec:
+      serviceAccountName: dotnet-app-sa
+      containers:
+        - name: dotnet-helloworld
+          image: <ECR_URI>:v1   # rebuild with a Postgres-compatible driver before this works - see warning above
+          ports:
+            - containerPort: 8080
+          env:
+            - name: ASPNETCORE_HTTP_PORTS
+              value: "8080"
+            - name: POSTGRES_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: dotnet-app-config-postgres
+                  key: POSTGRES_HOST
+            - name: POSTGRES_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: dotnet-app-config-postgres
+                  key: POSTGRES_PORT
+            - name: POSTGRES_DATABASE
+              valueFrom:
+                configMapKeyRef:
+                  name: dotnet-app-config-postgres
+                  key: POSTGRES_DATABASE
+            - name: POSTGRES_USERNAME
+              value: "postgresadmin"
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: POSTGRES_PASSWORD
+            - name: ConnectionStrings__Default
+              value: "Host=$(POSTGRES_HOST);Port=$(POSTGRES_PORT);Database=$(POSTGRES_DATABASE);Username=$(POSTGRES_USERNAME);Password=$(POSTGRES_PASSWORD);SSL Mode=Disable;"
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dotnet-helloworld-svc
+  namespace: dev
+  labels:
+    app: dotnet-helloworld
+spec:
+  type: ClusterIP
+  selector:
+    app: dotnet-helloworld
+  ports:
+    - port: 80
+      targetPort: 8080
+      protocol: TCP

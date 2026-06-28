@@ -111,7 +111,7 @@ echo "  Trident:            installed in the 'trident' namespace"
 echo "  Backend:            backend-tbc-anf (Azure NetApp Files)"
 echo "  StorageClass:       azure-netapp-files"
 echo "============================================================"
-echo "Next: apply the PostgreSQL manifests in dev-postgres-anf/"
+echo "Next: apply the PostgreSQL manifests in k8s/dev-postgres-anf/"
 
 cat >> .infra-state.env <<EOF
 TRIDENT_CLIENT_ID="$TRIDENT_CLIENT_ID"

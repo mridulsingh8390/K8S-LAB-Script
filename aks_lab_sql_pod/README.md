@@ -339,7 +339,7 @@ The relevant files:
 ```
 00b-azure-netapp-files.sh   - ANF account, capacity pool, delegated subnet
 01b-install-trident.sh      - Astra Trident CSI driver + backend config
-dev-postgres-anf/           - PVC, SecretProviderClass, Postgres StatefulSet,
+k8s/dev-postgres-anf/           - PVC, SecretProviderClass, Postgres StatefulSet,
                                and an app Deployment pointed at Postgres
 ```
 
@@ -347,7 +347,7 @@ Read **before** running any of this: the sample app (`HelloWorldApp.web`)
 was built and verified against SQL Server throughout this lab. Its source
 code was never confirmed to use a PostgreSQL-compatible .NET driver
 (Npgsql) rather than `Microsoft.Data.SqlClient`. Changing the connection
-string format in `dev-postgres-anf/03-app-deployment-postgres.yaml` makes
+string format in `k8s/dev-postgres-anf/03-app-deployment-postgres.yaml` makes
 the Kubernetes side correct for Postgres, but does **not** by itself make
 a SQL-Server-oriented app start working against Postgres — that requires
 the app's own source code to use a Postgres driver, which is a code
@@ -373,12 +373,12 @@ sed -i \
   -e "s|<USER-ASSIGNED-IDENTITY-CLIENT-ID>|$(az identity show -g "$RG" -n id-dotnet-app --query clientId -o tsv)|g" \
   -e "s|<KEY-VAULT-NAME>|${KV_NAME}|g" \
   -e "s|<AZURE-TENANT-ID>|$(az account show --query tenantId -o tsv)|g" \
-  dev-postgres-anf/01-secretproviderclass.yaml
-sed -i "s|<ACR_NAME>|${ACR_NAME}|g" dev-postgres-anf/03-app-deployment-postgres.yaml
+  k8s/dev-postgres-anf/01-secretproviderclass.yaml
+sed -i "s|<ACR_NAME>|${ACR_NAME}|g" k8s/dev-postgres-anf/03-app-deployment-postgres.yaml
 
-kubectl apply -f dev-postgres-anf/00-pvc.yaml
-kubectl apply -f dev-postgres-anf/01-secretproviderclass.yaml
-kubectl apply -f dev-postgres-anf/02-statefulset.yaml
+kubectl apply -f k8s/dev-postgres-anf/00-pvc.yaml
+kubectl apply -f k8s/dev-postgres-anf/01-secretproviderclass.yaml
+kubectl apply -f k8s/dev-postgres-anf/02-statefulset.yaml
 
 # verify the infrastructure side, independent of the app:
 kubectl get pvc -n dev postgres-data-anf       # should show STATUS: Bound
@@ -386,12 +386,12 @@ kubectl get pods -n dev -l app=postgres        # should show 1/1 Running
 kubectl exec -n dev postgres-0 -- pg_isready -U postgresadmin
 
 # only apply the app deployment once you've confirmed (or fixed) driver compatibility:
-kubectl apply -f dev-postgres-anf/03-app-deployment-postgres.yaml
+kubectl apply -f k8s/dev-postgres-anf/03-app-deployment-postgres.yaml
 ```
 
 Tearing this variant down (not covered by the main `cleanup.sh`):
 ```bash
-kubectl delete -f dev-postgres-anf/
+kubectl delete -f k8s/dev-postgres-anf/
 helm uninstall trident -n trident
 kubectl delete namespace trident
 az ad sp delete --id "$TRIDENT_CLIENT_ID"

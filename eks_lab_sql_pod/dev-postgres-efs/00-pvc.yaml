@@ -1,0 +1,26 @@
+# ---------------------------------------------------------------------------
+# Requests storage from the efs-sc StorageClass (set up in
+# 01b-install-efs-csi-driver.sh). The EFS CSI driver creates a real EFS
+# access point on demand when this PVC is created. accessModes is
+# ReadWriteOnce here even though EFS supports ReadWriteMany - a single
+# Postgres replica doesn't need shared access, and ReadWriteOnce is the
+# correct choice for "one specific pod owns this data," same reasoning as
+# the AKS lab's ANF-backed PVC.
+#
+# Storage size requested here is informational only for EFS access-point
+# provisioning - EFS itself has no fixed capacity the way EBS or ANF
+# volumes do; it grows and shrinks with actual usage and you're billed for
+# what's stored, not for a pre-allocated size.
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-data-efs
+  namespace: dev
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: efs-sc
+  resources:
+    requests:
+      storage: 20Gi

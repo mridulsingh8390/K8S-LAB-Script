@@ -102,13 +102,13 @@ sed -i \
   -e "s|<USER-ASSIGNED-IDENTITY-CLIENT-ID>|$(az identity show -g "$RG" -n id-dotnet-app --query clientId -o tsv)|g" \
   -e "s|<KEY-VAULT-NAME>|${KV_NAME}|g" \
   -e "s|<AZURE-TENANT-ID>|$(az account show --query tenantId -o tsv)|g" \
-  dev-postgres-anf/01-secretproviderclass.yaml
+  k8s/dev-postgres-anf/01-secretproviderclass.yaml
 
-sed -i "s|<ACR_NAME>|${ACR_NAME}|g" dev-postgres-anf/03-app-deployment-postgres.yaml
+sed -i "s|<ACR_NAME>|${ACR_NAME}|g" k8s/dev-postgres-anf/03-app-deployment-postgres.yaml
 
-kubectl apply -f dev-postgres-anf/00-pvc.yaml
-kubectl apply -f dev-postgres-anf/01-secretproviderclass.yaml
-kubectl apply -f dev-postgres-anf/02-statefulset.yaml
+kubectl apply -f k8s/dev-postgres-anf/00-pvc.yaml
+kubectl apply -f k8s/dev-postgres-anf/01-secretproviderclass.yaml
+kubectl apply -f k8s/dev-postgres-anf/02-statefulset.yaml
 ```
 
 ### 6. Verify Postgres itself is running and reachable, independent of the app
@@ -123,7 +123,7 @@ on the sample app's code being Postgres-compatible at all.
 
 ### 7. Only if you've confirmed (or fixed) the app's driver compatibility
 ```bash
-kubectl apply -f dev-postgres-anf/03-app-deployment-postgres.yaml
+kubectl apply -f k8s/dev-postgres-anf/03-app-deployment-postgres.yaml
 kubectl logs -n dev deploy/dotnet-helloworld
 ```
 If the app's code is still using `Microsoft.Data.SqlClient`, expect this
@@ -135,7 +135,7 @@ a problem with the Kubernetes manifests themselves.
 ## Tearing this down
 
 ```bash
-kubectl delete -f dev-postgres-anf/
+kubectl delete -f k8s/dev-postgres-anf/
 helm uninstall trident -n trident
 kubectl delete namespace trident
 az ad sp delete --id "$TRIDENT_CLIENT_ID"
