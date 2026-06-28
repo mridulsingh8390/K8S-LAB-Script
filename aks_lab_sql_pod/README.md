@@ -327,3 +327,79 @@ since it isn't part of the core manifest set:
 ```bash
 kubectl delete svc dotnet-helloworld-lb -n dev
 ```
+
+## Optional variant: running the database in-cluster instead of managed Azure SQL
+
+This repo also includes a separate, optional path: running PostgreSQL as
+a pod inside the cluster, with its data on Azure NetApp Files (ANF)
+storage, instead of using managed Azure SQL with a Private Endpoint.
+`run-all.sh` does **not** touch any of this — it's entirely opt-in.
+
+The relevant files:
+```
+00b-azure-netapp-files.sh   - ANF account, capacity pool, delegated subnet
+01b-install-trident.sh      - Astra Trident CSI driver + backend config
+dev-postgres-anf/           - PVC, SecretProviderClass, Postgres StatefulSet,
+                               and an app Deployment pointed at Postgres
+```
+
+Read **before** running any of this: the sample app (`HelloWorldApp.web`)
+was built and verified against SQL Server throughout this lab. Its source
+code was never confirmed to use a PostgreSQL-compatible .NET driver
+(Npgsql) rather than `Microsoft.Data.SqlClient`. Changing the connection
+string format in `dev-postgres-anf/03-app-deployment-postgres.yaml` makes
+the Kubernetes side correct for Postgres, but does **not** by itself make
+a SQL-Server-oriented app start working against Postgres — that requires
+the app's own source code to use a Postgres driver, which is a code
+change outside what these manifests can do. You can still validate every
+infrastructure piece (ANF volume provisioning, Postgres starting,
+accepting connections) independently of whether the sample app itself can
+successfully query it — see the verification step below.
+
+Brief sequence (assumes `00-azure-infra.sh` has already run, since this
+reuses that VNet/AKS cluster/Key Vault):
+```bash
+./00b-azure-netapp-files.sh      # ANF account, pool, delegated subnet
+./01b-install-trident.sh         # CSI driver for dynamic ANF provisioning
+
+# generate and store the Postgres password yourself (not automated,
+# since Postgres isn't created via an Azure control-plane API call):
+source .infra-state.env
+PG_PASSWORD="$(openssl rand -base64 24)"
+az keyvault secret set --vault-name "$KV_NAME" --name "postgres-admin-password" --value "$PG_PASSWORD"
+
+# fill in placeholders, then apply:
+sed -i \
+  -e "s|<USER-ASSIGNED-IDENTITY-CLIENT-ID>|$(az identity show -g "$RG" -n id-dotnet-app --query clientId -o tsv)|g" \
+  -e "s|<KEY-VAULT-NAME>|${KV_NAME}|g" \
+  -e "s|<AZURE-TENANT-ID>|$(az account show --query tenantId -o tsv)|g" \
+  dev-postgres-anf/01-secretproviderclass.yaml
+sed -i "s|<ACR_NAME>|${ACR_NAME}|g" dev-postgres-anf/03-app-deployment-postgres.yaml
+
+kubectl apply -f dev-postgres-anf/00-pvc.yaml
+kubectl apply -f dev-postgres-anf/01-secretproviderclass.yaml
+kubectl apply -f dev-postgres-anf/02-statefulset.yaml
+
+# verify the infrastructure side, independent of the app:
+kubectl get pvc -n dev postgres-data-anf       # should show STATUS: Bound
+kubectl get pods -n dev -l app=postgres        # should show 1/1 Running
+kubectl exec -n dev postgres-0 -- pg_isready -U postgresadmin
+
+# only apply the app deployment once you've confirmed (or fixed) driver compatibility:
+kubectl apply -f dev-postgres-anf/03-app-deployment-postgres.yaml
+```
+
+Tearing this variant down (not covered by the main `cleanup.sh`):
+```bash
+kubectl delete -f dev-postgres-anf/
+helm uninstall trident -n trident
+kubectl delete namespace trident
+az ad sp delete --id "$TRIDENT_CLIENT_ID"
+az netappfiles pool delete -g "$RG" -a "$ANF_ACCOUNT_NAME" -p "$ANF_POOL_NAME"
+az netappfiles account delete -g "$RG" -a "$ANF_ACCOUNT_NAME"
+az network vnet subnet delete -g "$RG" --vnet-name "$VNET_NAME" -n "snet-anf"
+```
+(Variables come from `.infra-state.env`.) Run this before or instead of
+the main `cleanup.sh`, or these ANF-specific resources will be left
+behind — and continue being billed — after the rest of the lab is torn
+down, since the main script has no knowledge of them.
