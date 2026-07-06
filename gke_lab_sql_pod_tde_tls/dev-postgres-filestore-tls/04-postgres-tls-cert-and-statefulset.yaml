@@ -1,0 +1,298 @@
+# ---------------------------------------------------------------------------
+# cert-manager TLS cert setup — identical to AKS/EKS variants.
+# ---------------------------------------------------------------------------
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: postgres-selfsigned-issuer
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: postgres-ca
+  namespace: dev
+spec:
+  isCA: true
+  commonName: postgres-ca
+  secretName: postgres-ca-secret
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  issuerRef:
+    name: postgres-selfsigned-issuer
+    kind: ClusterIssuer
+    group: cert-manager.io
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: postgres-ca-issuer
+  namespace: dev
+spec:
+  ca:
+    secretName: postgres-ca-secret
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: postgres-server-cert
+  namespace: dev
+spec:
+  secretName: postgres-tls
+  duration: 8760h
+  renewBefore: 720h
+  commonName: postgres
+  dnsNames:
+    - postgres-svc
+    - postgres-svc.dev
+    - postgres-svc.dev.svc.cluster.local
+    - postgres-headless
+    - postgres-headless.dev
+    - postgres-headless.dev.svc.cluster.local
+    - "postgres-0.postgres-headless.dev.svc.cluster.local"
+  issuerRef:
+    name: postgres-ca-issuer
+    kind: Issuer
+    group: cert-manager.io
+---
+# ---------------------------------------------------------------------------
+# PostgreSQL StatefulSet with init container + TLS for GKE.
+#
+# KEY DIFFERENCE FROM AKS/EKS:
+# GKE's init container uses the GCP Metadata Server to get an access token
+# for the pod's Workload Identity (GSA), then calls the Secret Manager REST
+# API directly. This is SIMPLER than AWS (no SigV4 signing needed — just a
+# Bearer token in the Authorization header, exactly like AKS) but uses a
+# different metadata endpoint and token format from Azure:
+#
+#   GCP: GET http://metadata.google.internal/computeMetadata/v1/instance/
+#            service-accounts/default/token
+#        Header: Metadata-Flavor: Google
+#        → returns {"access_token": "...", "token_type": "Bearer", ...}
+#
+#   Then: GET https://secretmanager.googleapis.com/v1/projects/PROJECT/
+#              secrets/SECRET/versions/latest:access
+#         Header: Authorization: Bearer <token>
+#         → returns {"payload": {"data": "<base64-encoded-value>"}}
+#
+# No Azure CLI, no AWS CLI, no SigV4 — just curl. Same simplicity as AKS.
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-tls-config
+  namespace: dev
+data:
+  postgresql.conf: |
+    ssl = on
+    ssl_cert_file = '/etc/postgresql/certs/tls.crt'
+    ssl_key_file  = '/etc/postgresql/certs/tls.key'
+    ssl_ca_file   = '/etc/postgresql/certs/ca.crt'
+    ssl_min_protocol_version = 'TLSv1.2'
+    ssl_prefer_server_ciphers = on
+    ssl_ciphers = 'HIGH:MEDIUM:+3DES:!aNULL'
+    listen_addresses = '*'
+    max_connections = 100
+    shared_buffers = 128MB
+    log_timezone = 'UTC'
+    datestyle = 'iso, mdy'
+    timezone = 'UTC'
+    lc_messages = 'en_US.utf8'
+    lc_monetary = 'en_US.utf8'
+    lc_numeric = 'en_US.utf8'
+    lc_time = 'en_US.utf8'
+    default_text_search_config = 'pg_catalog.english'
+  pg_hba.conf: |
+    local   all  all              trust
+    host    all  all  127.0.0.1/32 md5
+    host    all  all  ::1/128      md5
+    hostssl all  all  0.0.0.0/0    md5
+    hostssl all  all  ::/0         md5
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: dev
+spec:
+  serviceName: postgres-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      serviceAccountName: dotnet-app-sa
+      initContainers:
+        # ----------------------------------------------------------------
+        # Init container 1: fetch password from GCP Secret Manager
+        # using the pod's Workload Identity via GCP Metadata Server.
+        # Same simplicity as AKS — plain curl + Bearer token, no signing.
+        # ----------------------------------------------------------------
+        - name: fetch-sm-password
+          image: curlimages/curl:8.7.1
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              echo "==> Fetching access token from GCP Metadata Server"
+              TOKEN_RESPONSE=$(curl -s \
+                "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token" \
+                -H "Metadata-Flavor: Google")
+
+              ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | \
+                grep -o '"access_token":"[^"]*"' | \
+                cut -d'"' -f4)
+
+              if [ -z "$ACCESS_TOKEN" ]; then
+                echo "ERROR: failed to get access token from GCP Metadata Server"
+                echo "Response: $TOKEN_RESPONSE"
+                exit 1
+              fi
+
+              echo "==> Fetching gke-lab-postgres-password from Secret Manager"
+              SECRET_URL="https://secretmanager.googleapis.com/v1/projects/${PROJECT_ID}/secrets/gke-lab-postgres-password/versions/latest:access"
+              SECRET_RESPONSE=$(curl -s "${SECRET_URL}" \
+                -H "Authorization: Bearer ${ACCESS_TOKEN}")
+
+              # Secret Manager returns the value base64-encoded in .payload.data
+              B64_VALUE=$(echo "$SECRET_RESPONSE" | \
+                grep -o '"data":"[^"]*"' | \
+                cut -d'"' -f4)
+
+              if [ -z "$B64_VALUE" ]; then
+                echo "ERROR: failed to extract secret value from Secret Manager"
+                echo "Response: $SECRET_RESPONSE"
+                exit 1
+              fi
+
+              echo "$B64_VALUE" | base64 -d > /secrets/password
+              chmod 0400 /secrets/password
+              echo "==> Password written to /secrets/password"
+          env:
+            - name: PROJECT_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: postgres-tls-gke-config
+                  key: PROJECT_ID
+          volumeMounts:
+            - name: gcp-password
+              mountPath: /secrets
+
+        # Init container 2: fix TLS cert file permissions for Postgres
+        - name: fix-cert-permissions
+          image: postgres:16
+          command:
+            - sh
+            - -c
+            - |
+              cp /certs-source/tls.crt /certs/tls.crt
+              cp /certs-source/tls.key /certs/tls.key
+              cp /certs-source/ca.crt  /certs/ca.crt 2>/dev/null || cp /certs-source/tls.crt /certs/ca.crt
+              chmod 0600 /certs/tls.key
+              chmod 0644 /certs/tls.crt /certs/ca.crt
+              chown 999:999 /certs/tls.key /certs/tls.crt /certs/ca.crt
+              echo "==> TLS cert permissions fixed"
+          volumeMounts:
+            - name: tls-certs-source
+              mountPath: /certs-source
+              readOnly: true
+            - name: tls-certs-writable
+              mountPath: /certs
+
+      containers:
+        - name: postgres
+          image: postgres:16
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              value: "postgresadmin"
+            - name: POSTGRES_DB
+              value: "appdb"
+            - name: POSTGRES_PASSWORD_FILE
+              value: "/secrets/password"
+            - name: PGDATA
+              value: "/var/lib/postgresql/data/pgdata"
+          command:
+            - postgres
+            - -c
+            - config_file=/etc/postgresql/postgresql.conf
+            - -c
+            - hba_file=/etc/postgresql/pg_hba.conf
+          volumeMounts:
+            - name: postgres-storage
+              mountPath: /var/lib/postgresql/data
+            - name: gcp-password
+              mountPath: /secrets
+              readOnly: true
+            - name: tls-certs-writable
+              mountPath: /etc/postgresql/certs
+            - name: postgres-config
+              mountPath: /etc/postgresql
+              readOnly: true
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgresadmin"]
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgresadmin"]
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+
+      volumes:
+        - name: gcp-password
+          emptyDir:
+            medium: Memory
+        - name: tls-certs-source
+          secret:
+            secretName: postgres-tls
+            defaultMode: 0444
+        - name: tls-certs-writable
+          emptyDir: {}
+        - name: postgres-config
+          configMap:
+            name: postgres-tls-config
+        - name: postgres-storage
+          persistentVolumeClaim:
+            claimName: postgres-data-filestore
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-headless
+  namespace: dev
+spec:
+  clusterIP: None
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-svc
+  namespace: dev
+spec:
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432

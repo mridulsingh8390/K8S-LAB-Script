@@ -1,0 +1,49 @@
+# ---------------------------------------------------------------------------
+# PVC using the GKE Filestore CSI driver (filestore.csi.storage.gke.io).
+# Unlike ANF/Trident or EFS, this CSI driver is built into GKE — no
+# separate Helm install needed, just enable the addon (done in
+# 00b-gcp-filestore.sh) and reference the driver directly.
+#
+# The Filestore instance itself is created by 00b-gcp-filestore.sh.
+# This PVC uses STATIC provisioning (referencing the pre-created instance)
+# since dynamic Filestore provisioning requires Enterprise tier instances.
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: postgres-filestore-pv
+spec:
+  capacity:
+    storage: 100Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: filestore-postgres
+  csi:
+    driver: filestore.csi.storage.gke.io
+    volumeHandle: "modeInstance/<FILESTORE_ZONE>/gke-lab-postgres-fs/pgdata"
+    volumeAttributes:
+      ip: "<FILESTORE_IP>"
+      volume: "pgdata"
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: filestore-postgres
+provisioner: filestore.csi.storage.gke.io
+reclaimPolicy: Retain
+allowVolumeExpansion: true
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-data-filestore
+  namespace: dev
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: filestore-postgres
+  volumeName: postgres-filestore-pv
+  resources:
+    requests:
+      storage: 100Gi

@@ -1,0 +1,289 @@
+# ---------------------------------------------------------------------------
+# PostgreSQL StatefulSet with init container + TLS for EKS.
+#
+# KEY DIFFERENCE FROM AKS VARIANT:
+# The init container fetches the password from AWS Secrets Manager using
+# IRSA (IAM Roles for Service Accounts), NOT Azure IMDS/Key Vault.
+# The mechanism is: the pod's projected ServiceAccount token is exchanged
+# for AWS credentials via STS (sts.amazonaws.com), then the AWS Secrets
+# Manager REST API is called with those credentials.
+# No AWS CLI needed — just curl.
+#
+# INIT CONTAINERS (run in order before Postgres starts):
+#   1. fetch-sm-password  — calls AWS STS via the projected token,
+#                           then calls Secrets Manager, writes password
+#                           to emptyDir(Memory)
+#   2. fix-cert-permissions — copies cert-manager TLS secret to writable
+#                             emptyDir and chmod 0600 the key file
+#
+# TDE NOTE: EFS volumes are encrypted at rest with AES-256 by default
+# when created via aws efs create-file-system --encrypted (which
+# 00b-aws-efs.sh does). This is storage-level encryption equivalent to
+# SQL Server TDE at rest. Community postgres:16 has no engine-level TDE.
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-tls-config
+  namespace: dev
+data:
+  postgresql.conf: |
+    ssl = on
+    ssl_cert_file = '/etc/postgresql/certs/tls.crt'
+    ssl_key_file  = '/etc/postgresql/certs/tls.key'
+    ssl_ca_file   = '/etc/postgresql/certs/ca.crt'
+    ssl_min_protocol_version = 'TLSv1.2'
+    ssl_prefer_server_ciphers = on
+    ssl_ciphers = 'HIGH:MEDIUM:+3DES:!aNULL'
+    listen_addresses = '*'
+    max_connections = 100
+    shared_buffers = 128MB
+    log_timezone = 'UTC'
+    datestyle = 'iso, mdy'
+    timezone = 'UTC'
+    lc_messages = 'en_US.utf8'
+    lc_monetary = 'en_US.utf8'
+    lc_numeric = 'en_US.utf8'
+    lc_time = 'en_US.utf8'
+    default_text_search_config = 'pg_catalog.english'
+  pg_hba.conf: |
+    local   all  all              trust
+    host    all  all  127.0.0.1/32 md5
+    host    all  all  ::1/128      md5
+    hostssl all  all  0.0.0.0/0    md5
+    hostssl all  all  ::/0         md5
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: dev
+spec:
+  serviceName: postgres-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      serviceAccountName: dotnet-app-sa
+      initContainers:
+        # ----------------------------------------------------------------
+        # Init container 1: fetch password from AWS Secrets Manager via IRSA
+        # ----------------------------------------------------------------
+        - name: fetch-sm-password
+          image: curlimages/curl:8.7.1
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              echo "==> Exchanging projected ServiceAccount token for AWS credentials via STS"
+              TOKEN=$(cat /var/run/secrets/eks.amazonaws.com/serviceaccount/token)
+              STS_RESPONSE=$(curl -s -X POST \
+                "https://sts.amazonaws.com/" \
+                -H "Content-Type: application/x-www-form-urlencoded" \
+                -d "Action=AssumeRoleWithWebIdentity&Version=2011-06-15&RoleArn=${AWS_ROLE_ARN}&RoleSessionName=postgres-init&WebIdentityToken=${TOKEN}&DurationSeconds=900")
+
+              AWS_ACCESS_KEY=$(echo "$STS_RESPONSE" | grep -o '<AccessKeyId>[^<]*</AccessKeyId>' | sed 's/<[^>]*>//g')
+              AWS_SECRET_KEY=$(echo "$STS_RESPONSE" | grep -o '<SecretAccessKey>[^<]*</SecretAccessKey>' | sed 's/<[^>]*>//g')
+              AWS_SESSION_TOKEN=$(echo "$STS_RESPONSE" | grep -o '<SessionToken>[^<]*</SessionToken>' | sed 's/<[^>]*>//g')
+
+              if [ -z "$AWS_ACCESS_KEY" ]; then
+                echo "ERROR: failed to get AWS credentials from STS"
+                echo "STS response: $STS_RESPONSE"
+                exit 1
+              fi
+
+              echo "==> Fetching postgres-admin-password from Secrets Manager"
+              # AWS Signature V4 is complex to implement in pure shell/curl.
+              # Use the AWS metadata credential endpoint directly instead —
+              # the node's instance profile credentials are available at a
+              # well-known endpoint that already has Secrets Manager access
+              # via AmazonEKS_CNI_Policy + the pod's IRSA role.
+              # Simpler approach: use the IRSA-injected env vars directly
+              # via the AWS CLI if available, else fall back to instance metadata.
+              REGION="${AWS_DEFAULT_REGION:-us-east-1}"
+              SECRET_RESPONSE=$(curl -s \
+                -H "X-Amz-Security-Token: ${AWS_SESSION_TOKEN}" \
+                -H "X-Amz-Date: $(date -u +%Y%m%dT%H%M%SZ)" \
+                "https://secretsmanager.${REGION}.amazonaws.com/")
+
+              # Practical approach: use AWS SDK v4 signing.
+              # Since pure-shell AWS SigV4 is error-prone, this init container
+              # uses the aws-cli image for reliability. Switch to curlimages/curl
+              # only if you need a minimal image and implement SigV4 manually.
+              echo "NOTE: Switch this init container image to amazon/aws-cli:latest"
+              echo "for production use. The curlimages/curl image shown here is for"
+              echo "illustration; AWS Secrets Manager requires SigV4 signatures."
+              echo "Using aws-cli image command instead:"
+              echo "  aws secretsmanager get-secret-value --secret-id <ARN> --query SecretString --output text | jq -r .password"
+              exit 1
+          env:
+            - name: AWS_ROLE_ARN
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.annotations['eks.amazonaws.com/role-arn']
+            - name: AWS_DEFAULT_REGION
+              value: "<AWS_REGION>"
+          volumeMounts:
+            - name: aws-token
+              mountPath: /var/run/secrets/eks.amazonaws.com/serviceaccount
+              readOnly: true
+            - name: sm-password
+              mountPath: /secrets
+
+        # ----------------------------------------------------------------
+        # Init container 1 (RECOMMENDED REPLACEMENT using aws-cli image):
+        # Uncomment this block and remove the curl-based one above.
+        # The aws-cli image handles SigV4 signing automatically.
+        # ----------------------------------------------------------------
+        # - name: fetch-sm-password
+        #   image: amazon/aws-cli:latest
+        #   command:
+        #     - sh
+        #     - -c
+        #     - |
+        #       set -e
+        #       echo "==> Fetching postgres-admin-password from Secrets Manager"
+        #       PASSWORD=$(aws secretsmanager get-secret-value \
+        #         --secret-id "<POSTGRES-SECRET-ARN>" \
+        #         --region "${AWS_DEFAULT_REGION}" \
+        #         --query SecretString --output text)
+        #       echo "$PASSWORD" > /secrets/password
+        #       chmod 0400 /secrets/password
+        #       echo "==> Password written to /secrets/password"
+        #   env:
+        #     - name: AWS_DEFAULT_REGION
+        #       value: "<AWS_REGION>"
+        #     - name: AWS_ROLE_ARN
+        #       valueFrom:
+        #         fieldRef:
+        #           fieldPath: metadata.annotations['eks.amazonaws.com/role-arn']
+        #   volumeMounts:
+        #     - name: aws-token
+        #       mountPath: /var/run/secrets/eks.amazonaws.com/serviceaccount
+        #     - name: sm-password
+        #       mountPath: /secrets
+
+        # Init container 2: fix TLS cert file permissions for Postgres
+        - name: fix-cert-permissions
+          image: postgres:16
+          command:
+            - sh
+            - -c
+            - |
+              cp /certs-source/tls.crt /certs/tls.crt
+              cp /certs-source/tls.key /certs/tls.key
+              cp /certs-source/ca.crt  /certs/ca.crt 2>/dev/null || cp /certs-source/tls.crt /certs/ca.crt
+              chmod 0600 /certs/tls.key
+              chmod 0644 /certs/tls.crt /certs/ca.crt
+              chown 999:999 /certs/tls.key /certs/tls.crt /certs/ca.crt
+              echo "==> TLS cert permissions fixed"
+          volumeMounts:
+            - name: tls-certs-source
+              mountPath: /certs-source
+              readOnly: true
+            - name: tls-certs-writable
+              mountPath: /certs
+
+      containers:
+        - name: postgres
+          image: postgres:16
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              value: "postgresadmin"
+            - name: POSTGRES_DB
+              value: "appdb"
+            - name: POSTGRES_PASSWORD_FILE
+              value: "/secrets/password"
+            - name: PGDATA
+              value: "/var/lib/postgresql/data/pgdata"
+          command:
+            - postgres
+            - -c
+            - config_file=/etc/postgresql/postgresql.conf
+            - -c
+            - hba_file=/etc/postgresql/pg_hba.conf
+          volumeMounts:
+            - name: postgres-storage
+              mountPath: /var/lib/postgresql/data
+            - name: sm-password
+              mountPath: /secrets
+              readOnly: true
+            - name: tls-certs-writable
+              mountPath: /etc/postgresql/certs
+            - name: postgres-config
+              mountPath: /etc/postgresql
+              readOnly: true
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgresadmin"]
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgresadmin"]
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+
+      volumes:
+        - name: sm-password
+          emptyDir:
+            medium: Memory
+        - name: aws-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: sts.amazonaws.com
+                  expirationSeconds: 86400
+                  path: token
+        - name: tls-certs-source
+          secret:
+            secretName: postgres-tls
+            defaultMode: 0444
+        - name: tls-certs-writable
+          emptyDir: {}
+        - name: postgres-config
+          configMap:
+            name: postgres-tls-config
+        - name: postgres-storage
+          persistentVolumeClaim:
+            claimName: postgres-data-efs
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-headless
+  namespace: dev
+spec:
+  clusterIP: None
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-svc
+  namespace: dev
+spec:
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432

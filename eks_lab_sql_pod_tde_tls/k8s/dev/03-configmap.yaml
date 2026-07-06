@@ -1,0 +1,16 @@
+# ---------------------------------------------------------------------------
+# Unlike the AKS lab, there's very little non-secret connection info to put
+# here — RDS's host/port/dbname all flow through the Secrets Manager JSON
+# blob via the SecretProviderClass (see 02-secretproviderclass.yaml), since
+# that's where 00-aws-infra.sh already stored them alongside the
+# credentials. This ConfigMap is kept mostly for parity with the AKS lab's
+# structure and for any non-secret app config you want to add later.
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dotnet-app-config
+  namespace: dev
+data:
+  SQL_ENCRYPT: "true"
+  SQL_TRUST_SERVER_CERTIFICATE: "false"

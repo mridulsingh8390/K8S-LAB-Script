@@ -1,0 +1,114 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-tls-gke-config
+  namespace: dev
+data:
+  PROJECT_ID: "<PROJECT_ID>"
+  POSTGRES_HOST: "postgres-svc.dev.svc.cluster.local"
+  POSTGRES_PORT: "5432"
+  POSTGRES_DATABASE: "appdb"
+  POSTGRES_SSLMODE: "require"
+  POSTGRES_SSL_ROOT_CERT: "/etc/postgres-ca/ca.crt"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dotnet-helloworld
+  namespace: dev
+  labels:
+    app: dotnet-helloworld
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: dotnet-helloworld
+  template:
+    metadata:
+      labels:
+        app: dotnet-helloworld
+    spec:
+      serviceAccountName: dotnet-app-sa
+      containers:
+        - name: dotnet-helloworld
+          image: <AR_URI>:v1
+          ports:
+            - containerPort: 8080
+          env:
+            - name: ASPNETCORE_HTTP_PORTS
+              value: "8080"
+            - name: POSTGRES_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: postgres-tls-gke-config
+                  key: POSTGRES_HOST
+            - name: POSTGRES_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: postgres-tls-gke-config
+                  key: POSTGRES_PORT
+            - name: POSTGRES_DATABASE
+              valueFrom:
+                configMapKeyRef:
+                  name: postgres-tls-gke-config
+                  key: POSTGRES_DATABASE
+            - name: POSTGRES_USERNAME
+              value: "postgresadmin"
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_SSL_ROOT_CERT
+              valueFrom:
+                configMapKeyRef:
+                  name: postgres-tls-gke-config
+                  key: POSTGRES_SSL_ROOT_CERT
+            - name: ConnectionStrings__Default
+              value: "Host=$(POSTGRES_HOST);Port=$(POSTGRES_PORT);Database=$(POSTGRES_DATABASE);Username=$(POSTGRES_USERNAME);Password=$(POSTGRES_PASSWORD);SSL Mode=Require;Root Certificate=$(POSTGRES_SSL_ROOT_CERT);"
+          volumeMounts:
+            - name: postgres-ca
+              mountPath: /etc/postgres-ca
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+      volumes:
+        - name: postgres-ca
+          secret:
+            secretName: postgres-ca-secret
+            items:
+              - key: ca.crt
+                path: ca.crt
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dotnet-helloworld-svc
+  namespace: dev
+  labels:
+    app: dotnet-helloworld
+spec:
+  type: ClusterIP
+  selector:
+    app: dotnet-helloworld
+  ports:
+    - port: 80
+      targetPort: 8080
+      protocol: TCP
