@@ -1,0 +1,84 @@
+# ---------------------------------------------------------------------------
+# TLS certificate setup for PostgreSQL — two resources:
+#
+# 1. A self-signed ClusterIssuer (the CA that signs our Postgres certificate).
+#    For an internal cluster database, a self-signed CA is the right choice
+#    — there's no reason to involve a public CA (like Let's Encrypt) for
+#    traffic that never leaves the cluster.
+#
+# 2. A Certificate resource requesting the actual server cert. cert-manager
+#    watches for Certificate objects and materialises them as a Kubernetes
+#    Secret of type kubernetes.io/tls, containing tls.crt and tls.key.
+#    It also handles renewal automatically before the cert expires.
+#
+# The resulting secret (postgres-tls) is what the StatefulSet mounts.
+#
+# Apply this AFTER cert-manager is running (verify with
+# `kubectl get pods -n cert-manager` first).
+# ---------------------------------------------------------------------------
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: postgres-selfsigned-issuer
+spec:
+  selfSigned: {}
+---
+# The CA certificate — cert-manager creates this as an intermediate step
+# so we can sign the server cert with a stable CA cert (rather than a bare
+# self-signed cert) which makes client verification more robust.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: postgres-ca
+  namespace: dev
+spec:
+  isCA: true
+  commonName: postgres-ca
+  secretName: postgres-ca-secret
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  issuerRef:
+    name: postgres-selfsigned-issuer
+    kind: ClusterIssuer
+    group: cert-manager.io
+---
+# Use the CA we just created as the issuer for the server cert
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: postgres-ca-issuer
+  namespace: dev
+spec:
+  ca:
+    secretName: postgres-ca-secret
+---
+# The actual PostgreSQL server certificate.
+# The dnsNames list includes every hostname the Postgres pod might be
+# addressed by from within the cluster — both the headless-service DNS
+# names (for direct pod addressing) and the regular service name.
+# If a client connects using a name not in this list, TLS verification
+# will fail, which is the correct, secure behavior.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: postgres-server-cert
+  namespace: dev
+spec:
+  secretName: postgres-tls
+  duration: 8760h   # 1 year
+  renewBefore: 720h  # renew 30 days before expiry
+  commonName: postgres
+  dnsNames:
+    - postgres-svc
+    - postgres-svc.dev
+    - postgres-svc.dev.svc
+    - postgres-svc.dev.svc.cluster.local
+    - postgres-headless
+    - postgres-headless.dev
+    - postgres-headless.dev.svc.cluster.local
+    - "postgres-0.postgres-headless.dev.svc.cluster.local"
+  issuerRef:
+    name: postgres-ca-issuer
+    kind: Issuer
+    group: cert-manager.io

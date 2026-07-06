@@ -1,0 +1,40 @@
+# ---------------------------------------------------------------------------
+# cert-manager — installs the certificate lifecycle manager into the cluster.
+# This handles generating, renewing, and rotating TLS certificates
+# automatically, so you never have to manually track expiry dates.
+#
+# cert-manager is a cluster-wide tool and is installed in its own namespace.
+# If you already have cert-manager installed (e.g. from another workload),
+# skip this file — applying it twice is safe (kubectl apply is idempotent
+# for CRDs and Deployments) but will generate unnecessary noise.
+#
+# Version: v1.14.0 — check https://github.com/cert-manager/cert-manager/releases
+# for the current stable release and update the URL below accordingly.
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cert-manager
+---
+# Install cert-manager CRDs first (Certificate, Issuer, ClusterIssuer, etc.)
+# then the controller components. This is the recommended single-manifest
+# install approach from the cert-manager docs.
+# Applied via: kubectl apply -f 04-cert-manager.yaml
+# Then wait: kubectl wait --for=condition=Available deployment --all -n cert-manager --timeout=120s
+#
+# NOTE: This file is a placeholder that references the upstream manifest.
+# The actual CRDs and controller manifests are fetched from the official
+# release URL below at apply time. This avoids embedding hundreds of lines
+# of generated YAML directly into this repo.
+#
+# To apply: kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.14.0/cert-manager.yaml
+# Then verify: kubectl get pods -n cert-manager
+#
+# If you prefer Helm (recommended for production, easier to upgrade):
+#   helm repo add jetstack https://charts.jetstack.io
+#   helm repo update
+#   helm install cert-manager jetstack/cert-manager \
+#     --namespace cert-manager \
+#     --create-namespace \
+#     --version v1.14.0 \
+#     --set crds.enabled=true

@@ -1,0 +1,288 @@
+# ---------------------------------------------------------------------------
+# PostgreSQL StatefulSet with two enhancements over the basic version:
+#
+# ENHANCEMENT 1 — INIT CONTAINER FETCHING PASSWORD FROM KEY VAULT
+# ----------------------------------------------------------------
+# An init container runs BEFORE the Postgres container starts. It:
+#   1. Calls the Azure IMDS endpoint (169.254.169.254) to get a bearer
+#      token for the pod's workload identity
+#   2. Uses that token to call the Key Vault REST API directly (no Azure
+#      CLI, no CSI driver — just curl, available in any minimal image)
+#   3. Writes the password value to a shared emptyDir volume (/vault/password)
+# The Postgres container then reads its POSTGRES_PASSWORD from that file.
+#
+# WHY THIS INSTEAD OF THE CSI DRIVER:
+# The CSI driver approach (used in the original dev-postgres-anf/ variant)
+# is perfectly correct and commonly used. The init-container approach
+# gives you explicit, auditable control over the fetch step — you can see
+# it in the pod's logs, you can reproduce it manually, and there's no
+# extra DaemonSet (the CSI driver) involved. The trade-off is that the
+# init container approach only fetches once at pod startup and doesn't
+# auto-rotate the mounted value, whereas the CSI driver (with
+# enableSecretRotation=true) will refresh the mounted file periodically.
+# For a database password, "fetch at startup" is generally fine since a
+# pod restart already triggers a re-fetch.
+#
+# ENHANCEMENT 2 — TLS (ENCRYPTION IN TRANSIT)
+# --------------------------------------------
+# A ConfigMap holds postgresql.conf (ssl = on, cert paths) and pg_hba.conf
+# (hostssl — only encrypted connections accepted from remote clients).
+# The cert-manager-generated TLS secret (postgres-tls, from
+# 05-postgres-tls-cert.yaml) is mounted read-only into the Postgres
+# container. An additional init container (fix-cert-permissions) copies
+# the cert files to a writable location and applies the exact permissions
+# Postgres requires (0600 for the key file, owned by the postgres user,
+# uid 999) — without this permissions fix, Postgres refuses to start
+# with "certificate file has wrong ownership" or similar errors.
+#
+# WHAT "TDE" MEANS FOR POSTGRESQL:
+# True Transparent Data Encryption (TDE) as SQL Server implements it
+# (engine-level, encrypts every page on disk) is NOT available in the
+# community postgres:16 image. What this manifest provides:
+#   - TLS in transit (this file): encrypted connection between app and DB
+#   - Storage-level encryption at rest: the ANF volume itself is encrypted
+#     by Azure NetApp Files by default (AES-256) — this is the practical
+#     equivalent of SQL Server TDE at rest in the Postgres-on-K8s world
+# If you need actual engine-level TDE for Postgres, you need either
+# EDB Postgres Advanced Server (paid) or a custom-compiled Postgres build
+# with the pg_tde extension (experimental as of 2026).
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-tls-config
+  namespace: dev
+data:
+  postgresql.conf: |
+    # TLS configuration
+    ssl = on
+    ssl_cert_file = '/etc/postgresql/certs/tls.crt'
+    ssl_key_file  = '/etc/postgresql/certs/tls.key'
+    ssl_ca_file   = '/etc/postgresql/certs/ca.crt'
+    ssl_min_protocol_version = 'TLSv1.2'
+    ssl_prefer_server_ciphers = on
+    ssl_ciphers = 'HIGH:MEDIUM:+3DES:!aNULL'
+
+    # Standard settings
+    listen_addresses = '*'
+    max_connections = 100
+    shared_buffers = 128MB
+    log_timezone = 'UTC'
+    datestyle = 'iso, mdy'
+    timezone = 'UTC'
+    lc_messages = 'en_US.utf8'
+    lc_monetary = 'en_US.utf8'
+    lc_numeric = 'en_US.utf8'
+    lc_time = 'en_US.utf8'
+    default_text_search_config = 'pg_catalog.english'
+  pg_hba.conf: |
+    # TYPE  DATABASE  USER  ADDRESS      METHOD
+    # Local connections (from within the same pod, e.g. pg_isready health checks) - trust
+    local   all       all                trust
+    # Loopback without TLS (needed for pg_isready and internal tools)
+    host    all       all   127.0.0.1/32 md5
+    host    all       all   ::1/128      md5
+    # All remote connections require TLS (hostssl = reject non-SSL)
+    hostssl all       all   0.0.0.0/0    md5
+    hostssl all       all   ::/0         md5
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: dev
+spec:
+  serviceName: postgres-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+        azure.workload.identity/use: "true"
+    spec:
+      serviceAccountName: dotnet-app-sa
+      # ----------------------------------------------------------------
+      # INIT CONTAINERS — run in order before the main container starts
+      # ----------------------------------------------------------------
+      initContainers:
+        # Init container 1: fetch the Postgres password from Key Vault
+        # using the pod's Workload Identity, write it to a shared volume.
+        - name: fetch-kv-password
+          image: curlimages/curl:8.7.1   # minimal image, has curl + sh, nothing else needed
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              echo "==> Fetching workload identity token from IMDS"
+              IMDS_URL="http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://vault.azure.net&client_id=${AZURE_CLIENT_ID}"
+              TOKEN_RESPONSE=$(curl -s "${IMDS_URL}" -H "Metadata: true")
+
+              ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | \
+                grep -o '"access_token":"[^"]*"' | \
+                cut -d'"' -f4)
+
+              if [ -z "$ACCESS_TOKEN" ]; then
+                echo "ERROR: failed to get access token from IMDS"
+                echo "Response was: $TOKEN_RESPONSE"
+                exit 1
+              fi
+
+              echo "==> Fetching postgres-admin-password from Key Vault"
+              SECRET_RESPONSE=$(curl -s \
+                "https://${KV_NAME}.vault.azure.net/secrets/postgres-admin-password?api-version=7.4" \
+                -H "Authorization: Bearer ${ACCESS_TOKEN}")
+
+              PASSWORD=$(echo "$SECRET_RESPONSE" | \
+                grep -o '"value":"[^"]*"' | \
+                cut -d'"' -f4)
+
+              if [ -z "$PASSWORD" ]; then
+                echo "ERROR: failed to extract password from Key Vault response"
+                echo "Response was: $SECRET_RESPONSE"
+                exit 1
+              fi
+
+              echo "$PASSWORD" > /vault/password
+              chmod 0400 /vault/password
+              echo "==> Password written to /vault/password successfully"
+          env:
+            # AZURE_CLIENT_ID is automatically injected by the Workload Identity webhook
+            # (the pod has azure.workload.identity/use: "true" and uses dotnet-app-sa)
+            - name: KV_NAME
+              valueFrom:
+                configMapKeyRef:
+                  name: dotnet-app-config
+                  key: KV_NAME   # add KV_NAME to the ConfigMap (see note below)
+          volumeMounts:
+            - name: kv-password
+              mountPath: /vault
+
+        # Init container 2: fix TLS cert file permissions.
+        # cert-manager mounts the secret read-only with root ownership.
+        # Postgres (running as uid 999) requires the key file to be:
+        #   - owned by the postgres user (uid 999), OR owned by root but
+        #     only readable by owner (mode 0600)
+        # We copy the certs to a writable emptyDir and fix permissions there.
+        - name: fix-cert-permissions
+          image: postgres:16
+          command:
+            - sh
+            - -c
+            - |
+              cp /certs-source/tls.crt /certs/tls.crt
+              cp /certs-source/tls.key /certs/tls.key
+              cp /certs-source/ca.crt  /certs/ca.crt  2>/dev/null || \
+                cp /certs-source/tls.crt /certs/ca.crt   # fallback: use server cert as CA if no separate ca.crt
+              chmod 0600 /certs/tls.key
+              chmod 0644 /certs/tls.crt
+              chmod 0644 /certs/ca.crt
+              chown 999:999 /certs/tls.key /certs/tls.crt /certs/ca.crt
+              echo "==> TLS cert permissions fixed"
+          volumeMounts:
+            - name: tls-certs-source
+              mountPath: /certs-source
+              readOnly: true
+            - name: tls-certs-writable
+              mountPath: /certs
+
+      # ----------------------------------------------------------------
+      # MAIN CONTAINER — Postgres with TLS and password from init container
+      # ----------------------------------------------------------------
+      containers:
+        - name: postgres
+          image: postgres:16
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              value: "postgresadmin"
+            - name: POSTGRES_DB
+              value: "appdb"
+            - name: POSTGRES_PASSWORD_FILE
+              value: "/vault/password"   # Postgres natively supports reading password from a file via this env var
+            - name: PGDATA
+              value: "/var/lib/postgresql/data/pgdata"
+          command:
+            - postgres
+            - -c
+            - config_file=/etc/postgresql/postgresql.conf
+            - -c
+            - hba_file=/etc/postgresql/pg_hba.conf
+          volumeMounts:
+            - name: postgres-storage
+              mountPath: /var/lib/postgresql/data
+            - name: kv-password
+              mountPath: /vault
+              readOnly: true
+            - name: tls-certs-writable
+              mountPath: /etc/postgresql/certs
+              readOnly: false   # the writable copy, already chmod'd by the init container
+            - name: postgres-config
+              mountPath: /etc/postgresql
+              readOnly: true
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgresadmin"]
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgresadmin"]
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+
+      # ----------------------------------------------------------------
+      # VOLUMES
+      # ----------------------------------------------------------------
+      volumes:
+        - name: kv-password
+          emptyDir:
+            medium: Memory   # stored in RAM, not on disk — the password never touches a filesystem
+        - name: tls-certs-source
+          secret:
+            secretName: postgres-tls   # generated by cert-manager from 05-postgres-tls-cert.yaml
+            defaultMode: 0444
+        - name: tls-certs-writable
+          emptyDir: {}   # writable copy for the permission-fixed certs
+        - name: postgres-config
+          configMap:
+            name: postgres-tls-config
+        - name: postgres-storage
+          persistentVolumeClaim:
+            claimName: postgres-data-anf
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-headless
+  namespace: dev
+spec:
+  clusterIP: None
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-svc
+  namespace: dev
+spec:
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432

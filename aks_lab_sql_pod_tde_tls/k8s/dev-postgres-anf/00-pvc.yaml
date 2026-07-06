@@ -1,0 +1,18 @@
+# ---------------------------------------------------------------------------
+# Requests a 100Gi volume from the azure-netapp-files StorageClass (set up
+# in 01b-install-trident.sh). Trident creates a real ANF volume on demand
+# when this PVC is created - nothing pre-provisioned needed beyond the
+# capacity pool itself.
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-data-anf
+  namespace: dev
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: azure-netapp-files
+  resources:
+    requests:
+      storage: 100Gi

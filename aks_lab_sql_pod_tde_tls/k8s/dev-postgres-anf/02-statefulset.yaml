@@ -1,0 +1,117 @@
+# ---------------------------------------------------------------------------
+# PostgreSQL running as a StatefulSet (not a Deployment) - a real database
+# needs a StatefulSet, not a Deployment, because each replica needs a
+# stable, predictable identity and its own dedicated storage that follows
+# it specifically if the pod is rescheduled. A Deployment's replicas are
+# interchangeable by design; a database's replicas are not.
+#
+# This lab runs a single Postgres replica (replicas: 1) - this is NOT
+# high availability. Real production Postgres-in-Kubernetes setups
+# typically use an operator (Zalando's postgres-operator, CloudNativePG, or
+# similar) to manage replication, failover, and backups properly. This
+# manifest is the minimum needed to demonstrate "database runs as a pod
+# with ANF-backed storage," not a production-ready HA database.
+# ---------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: dev
+spec:
+  serviceName: postgres-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+        azure.workload.identity/use: "true"
+    spec:
+      serviceAccountName: dotnet-app-sa   # reuses the same workload identity already set up for Key Vault access
+      containers:
+        - name: postgres
+          image: postgres:16
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              value: "postgresadmin"
+            - name: POSTGRES_DB
+              value: "appdb"
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: POSTGRES_PASSWORD
+            - name: PGDATA
+              value: "/var/lib/postgresql/data/pgdata"   # subdirectory, not the mount root - avoids issues with NFS's lost+found directory
+          volumeMounts:
+            - name: postgres-storage
+              mountPath: /var/lib/postgresql/data
+            - name: secrets-store
+              mountPath: "/mnt/secrets-store"
+              readOnly: true
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgresadmin"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgresadmin"]
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+      volumes:
+        - name: postgres-storage
+          persistentVolumeClaim:
+            claimName: postgres-data-anf
+        - name: secrets-store
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: postgres-kv-spc
+---
+# Headless Service: gives the StatefulSet pod a stable DNS name
+# (postgres-0.postgres-headless.dev.svc.cluster.local) rather than a
+# load-balanced ClusterIP, which is the correct pattern for a stateful
+# single-instance database - you want to talk to a specific pod, not
+# whichever one a ClusterIP happens to route to.
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-headless
+  namespace: dev
+spec:
+  clusterIP: None
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+---
+# Regular ClusterIP Service for the app to connect through - with only one
+# replica this is equivalent to the headless service, but keeping both
+# means the app's connection string doesn't need to change if you later
+# move to a real HA setup with multiple Postgres pods behind a proper
+# primary/replica routing layer.
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-svc
+  namespace: dev
+spec:
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
